@@ -14,7 +14,7 @@ marne
 ### Environment variable
 
 ```sh
-WINEDLLOVERRIDES=winmm=n,b;dinput8=n,b;Marne=n,b;
+WINEDLLOVERRIDES=dinput8=n,b;Marne=n,b;winmm=n,b;
 ```
 
 (Should be set to `native,builtin`)

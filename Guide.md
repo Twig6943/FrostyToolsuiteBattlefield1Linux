@@ -32,3 +32,4 @@ WINEDLLOVERRIDES=dinput8=n,b;Marne=n,b;winmm=n,b;
 ![](/assets/01.png)
 
 7.Launch the game and everything should work.
+

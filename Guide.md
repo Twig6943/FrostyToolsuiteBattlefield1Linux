@@ -11,13 +11,13 @@ dinput8
 marne
 ```
 
+(Should be set to `native,builtin`)
+
 ### Environment variable
 
 ```sh
 WINEDLLOVERRIDES=dinput8=n,b;Marne=n,b;winmm=n,b;
 ```
-
-(Should be set to `native,builtin`)
 
 3.Run `taskmgr` inside the wineprefix
 

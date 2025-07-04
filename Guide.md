@@ -6,9 +6,9 @@
 
 ### Winecfg
 ```sh
-winmm
 dinput8
 marne
+winmm
 ```
 
 (Should be set to `native,builtin`)

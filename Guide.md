@@ -24,7 +24,7 @@ winmm
 
 (Should be set to `native,builtin`)
 
-## Environment variables
+## Environment variable
 
 ### Marne
 

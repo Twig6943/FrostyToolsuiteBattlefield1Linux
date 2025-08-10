@@ -4,24 +4,43 @@
 
 2.Add the following dlloverrides to your wineprefix via `winecfg` & environment variable :
 
-### Winecfg
+## Winecfg
+
+### Marne
+
 ```sh
 dinput8
 marne
 winmm
 ```
 
-(Should be set to `native,builtin`)
-
-### Environment variable
+# Tonga
 
 ```sh
-WINEDLLOVERRIDES=dinput8=n,b;Marne=n,b;winmm=n,b;
+dinput8
+tonga
+winmm
+```
+
+(Should be set to `native,builtin`)
+
+## Environment variables
+
+### Marne
+
+```sh
+WINEDLLOVERRIDES=dinput8=n,b;Marne=n,b;winmm=n,b
+```
+
+### Tonga
+
+```sh
+WINEDLLOVERRIDES=dinput8=n,b;Tonga=n,b;crypthook=n,b;winmm=n,b
 ```
 
 3.Run `taskmgr` inside the wineprefix
 
-4.Select the .exe for the fmm bf1 linux build
+4.Select the FrostyModManager.exe
 
 5.Load & apply the mods you want
 
@@ -32,4 +51,3 @@ WINEDLLOVERRIDES=dinput8=n,b;Marne=n,b;winmm=n,b;
 ![](/assets/01.png)
 
 7.Launch the game and everything should work.
-

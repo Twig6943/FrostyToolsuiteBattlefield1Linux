@@ -48,6 +48,6 @@ WINEDLLOVERRIDES=dinput8=n,b;Tonga=n,b;crypthook=n,b;winmm=n,b
 
 (You need to get the path for that folder using a wine/windows explorer)
 
-![](/assets/01.png)
+![](/assets/1.webp)
 
 7.Launch the game and everything should work.

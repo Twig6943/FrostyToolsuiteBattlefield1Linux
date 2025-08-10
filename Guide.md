@@ -1,6 +1,6 @@
 # How to use this thing
 
-1.Download the binaries from the [releases section](https://github.com/twig6943/FrostyToolsuiteBF1linux/releases)
+1.Download the binaries from the [releases section](https://github.com/Twig6943/FrostyToolsuiteBattlefieldLinux/releases)
 
 2.Add the following dlloverrides to your wineprefix via `winecfg` & environment variable :
 

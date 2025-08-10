@@ -3,6 +3,7 @@ using FrostySdk;
 using FrostySdk.Interfaces;
 using FrostySdk.Managers;
 using System;
+using System.Collections.Generic;
 using System.Windows;
 
 namespace Frosty.Core
@@ -17,8 +18,9 @@ namespace Frosty.Core
         public static string SelectedProfile;
         public static string SelectedPack;
         public static ILogger Logger;
+        public static HashSet<int> WhitelistedBundles = new HashSet<int>();
 
-        public static readonly int Version = 6;
+        public static readonly int Version = 1;
 
         public static string ProfileSettingsPath => Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData) + "/Frosty/" + ProfilesLibrary.ProfileName;
         public static string GlobalSettingsPath => Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData) + "/Frosty";

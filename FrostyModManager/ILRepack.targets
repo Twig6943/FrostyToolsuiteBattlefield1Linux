@@ -1,0 +1,53 @@
+﻿<?xml version="1.0" encoding="utf-8" ?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+    <!-- ILRepack -->
+    <Target Name="ILRepacker" AfterTargets="Build" Condition="'$(Configuration)|$(Platform)' == 'Release - Final|x64'">
+        <ItemGroup>
+            <InputAssemblies Include="$(OutputPath)\$(AssemblyName).exe" />
+            <InputAssemblies Include="$(OutputPath)\System.Buffers.dll" />
+            <InputAssemblies Include="$(OutputPath)\System.Memory.dll" />
+            <InputAssemblies Include="$(OutputPath)\System.Numerics.Vectors.dll" />
+            <InputAssemblies Include="$(OutputPath)\System.Runtime.CompilerServices.Unsafe.dll" />
+        </ItemGroup>
+    
+        <ILRepack
+            AllowDuplicateResources="false"
+            Parallel="true"
+            Internalize="true"
+            InputAssemblies="@(InputAssemblies)"
+            TargetKind="WinExe"
+            OutputFile="$(OutputPath)\$(AssemblyName).exe"
+        />
+    </Target>
+    <!-- /ILRepack -->
+	
+	<Target Name="DeleteDlls" AfterTargets="ILRepacker" Condition="'$(Configuration)|$(Platform)' == 'Release - Final|x64'">
+		<ItemGroup>
+			<FilesToDelete Include="$(OutputPath)\System.Buffers.dll"/>
+			<FilesToDelete Include="$(OutputPath)\System.Memory.dll"/>
+			<FilesToDelete Include="$(OutputPath)\System.Numerics.Vectors.dll"/>
+			<FilesToDelete Include="$(OutputPath)\System.Runtime.CompilerServices.Unsafe.dll"/>
+		</ItemGroup>
+		
+		<Message Text="Deleting packed dlls"/>
+		<Delete Files="@(FilesToDelete)" />
+	</Target>
+
+	<Target Name="DeleteTrash" AfterTargets="DeleteDlls" Condition="'$(Configuration)|$(Platform)' == 'Release - Final|x64'">
+		<ItemGroup>
+			<FilesToDelete Include="$(OutputPath)\crashlog.txt"/>
+			<FilesToDelete Include="$(OutputPath)\executor.log"/>
+			<FilesToDelete Include="$(OutputPath)\FrostyControls.pdb"/>
+			<FilesToDelete Include="$(OutputPath)\FrostyCore.pdb"/>
+			<FilesToDelete Include="$(OutputPath)\FrostyCore.xml"/>
+			<FilesToDelete Include="$(OutputPath)\FrostyHash.pdb"/>
+			<FilesToDelete Include="$(OutputPath)\FrostyModManager.pdb"/>
+			<FilesToDelete Include="$(OutputPath)\FrostyModSupport.pdb"/>
+			<FilesToDelete Include="$(OutputPath)\FrostySdk.pdb"/>
+			<FilesToDelete Include="$(OutputPath)\sdk.log"/>
+		</ItemGroup>
+
+		<Message Text="Deleting trash"/>
+		<Delete Files="@(FilesToDelete)" />
+	</Target>
+</Project>

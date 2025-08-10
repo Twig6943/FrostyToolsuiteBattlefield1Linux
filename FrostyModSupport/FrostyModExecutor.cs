@@ -2,19 +2,24 @@
 using Frosty.Core;
 using Frosty.Core.Mod;
 using Frosty.Hash;
+using FrostyModManager;
 using FrostySdk;
+using FrostySdk.Ebx;
 using FrostySdk.Interfaces;
 using FrostySdk.IO;
 using FrostySdk.Managers;
+using FrostySdk.Resources;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Serialization;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Runtime.InteropServices;
 using System.Threading;
+using System.Threading.Tasks;
+using static Frosty.Core.Screens.GFSDK_ShadowLib;
 
 namespace Frosty.ModSupport
 {
@@ -22,31 +27,134 @@ namespace Frosty.ModSupport
     {
         private class ArchiveInfo
         {
-            public byte[] Data;
+            private byte[] _data;
+
+            private AssetManager _assetManager;
+            private AssetEntry _assetEntry;
+
+            private IResourceContainer _resourceContainer;
+            private BaseModResource _modResource;
+
+            private string _modPath;
+            private DbObject _dbObject;
+
+            private FileSystem _fs;
+            private ManifestFileRef? _fileRef = null;
+            private long _offset;
+
+            public void SetResourceOrigin(IResourceContainer resourceContainer, BaseModResource resource)
+            {
+                _resourceContainer = resourceContainer;
+                _modResource = resource;
+            }
+
+            public void SetRawOrigin(AssetManager assetManager, AssetEntry assetEntry)
+            {
+                _assetManager = assetManager;
+                _assetEntry = assetEntry;
+            }
+
+            public void SetLegacyResourceOrigin(string modPath, DbObject dbObject, AssetEntry assetEntry)
+            {
+                _modPath = modPath;
+                _dbObject = dbObject;
+                _assetEntry = assetEntry;
+            }
+
+            public void SetLegacyRawOrigin(FileSystem fs, ManifestFileRef fileRef, long offset, AssetEntry assetEntry)
+            {
+                _fs = fs;
+                _fileRef = fileRef;
+                _offset = offset;
+                _assetEntry = assetEntry;
+            }
+
+            public byte[] Data
+            {
+                get
+                {
+                    if (_data != null && _data.Length >= 0)
+                    {
+                        return _data;
+                    }
+
+                    if (_resourceContainer != null && _modResource != null)
+                    {
+                        var result = _resourceContainer.GetResourceData(_modResource);
+                        if (result != null)
+                        {
+                            return result;
+                        }
+                    }
+
+                    if (_assetManager != null && _assetEntry != null)
+                    {
+                        var result = NativeReader.ReadInStream(_assetManager.GetRawStream(_assetEntry));
+                        if (result != null)
+                        {
+                            return result;
+                        }
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(_modPath) && _dbObject != null && _assetEntry != null)
+                    {
+                        var result = GetResourceData(_modPath, _dbObject.GetValue<int>("archiveIndex"), _dbObject.GetValue<long>("archiveOffset"), (int)_assetEntry.Size);
+                        if (result != null)
+                        {
+                            return result;
+                        }
+                    }
+
+                    if (_fs != null && _fileRef != null && _assetEntry != null)
+                    {
+                        using (NativeReader reader = new NativeReader(new FileStream(_fs.ResolvePath(_fileRef.Value), FileMode.Open, FileAccess.Read)))
+                        {
+                            reader.Position = _offset;
+                            var result = reader.ReadBytes((int)_assetEntry.Size);
+                            if (result != null)
+                            {
+                                return result;
+                            }
+                        }
+                    }
+
+                    return _data;
+                }
+                set
+                {
+                    _data = value;
+                }
+            }
             public int RefCount;
         }
         private class ModBundleInfo
         {
             public class ModBundleAction
             {
-                public List<string> Ebx = new List<string>();
-                public List<string> Res = new List<string>();
-                public List<Guid> Chunks = new List<Guid>();
+                public HashSet<string> Ebx = new HashSet<string>();
+                public HashSet<string> Res = new HashSet<string>();
+                public HashSet<Guid> Chunks = new HashSet<Guid>();
 
                 public void AddEbx(string name)
                 {
-                    if (!Ebx.Contains(name))
+                    lock (Ebx)
+                    {
                         Ebx.Add(name);
+                    }
                 }
                 public void AddRes(string name)
                 {
-                    if (!Res.Contains(name))
+                    lock (Res)
+                    {
                         Res.Add(name);
+                    }
                 }
                 public void AddChunk(Guid guid)
                 {
-                    if (!Chunks.Contains(guid))
+                    lock (Chunks)
+                    {
                         Chunks.Add(guid);
+                    }
                 }
             }
             public int Name;
@@ -64,14 +172,14 @@ namespace Frosty.ModSupport
             public string Catalog { get; }
             public bool HasEntries => dataRefs.Count != 0;
 
-            private List<Sha1> dataRefs = new List<Sha1>();
+            private HashSet<Sha1> dataRefs = new HashSet<Sha1>();
             private Dictionary<Sha1, List<CasFileEntry>> fileInfos = new Dictionary<Sha1, List<CasFileEntry>>();
 
             public CasDataEntry(string inCatalog, params Sha1[] sha1)
             {
                 Catalog = inCatalog;
                 if (sha1.Length != 0)
-                    dataRefs.AddRange(sha1);
+                    dataRefs.UnionWith(sha1);
             }
 
             public void Add(Sha1 sha1, ChunkAssetEntry entry = null, ManifestFileInfo file = null)
@@ -96,10 +204,9 @@ namespace Frosty.ModSupport
 
             public IEnumerable<CasFileEntry> EnumerateFileInfos(Sha1 sha1)
             {
-                int index = dataRefs.IndexOf(sha1);
-                if (index == -1)
+                if (!dataRefs.Contains(sha1))
                     yield break;
-                if (index >= fileInfos.Count)
+                if (!fileInfos.ContainsKey(sha1))
                     yield break;
                 foreach (CasFileEntry fi in fileInfos[sha1])
                     yield return fi;
@@ -122,10 +229,18 @@ namespace Frosty.ModSupport
                 foreach (CasDataEntry entry in entries.Values)
                     yield return entry;
             }
+
+            public int GetEntryCount()
+            {
+                return entries.Count;
+            }
         }
-        private class FrostySymLinkException : Exception
+
+        [JsonObject(NamingStrategyType = typeof(SnakeCaseNamingStrategy))]
+        private class ModSetup
         {
-            public override string Message => "One ore more symbolic links could not be created, please restart tool as Administrator and ensure your storage drive is formatted to NTFS (not exFAT).";
+            public bool IsHardlink { get; set; } = false;
+            public List<ModInfo> ModInfos { get; set; } = new List<ModInfo>();
         }
 
         [JsonObject(NamingStrategyType = typeof(SnakeCaseNamingStrategy))]
@@ -140,15 +255,28 @@ namespace Frosty.ModSupport
 
             public override bool Equals(object obj)
             {
-                ModInfo modInfo = obj as ModInfo;
-
-                if (this.Name == modInfo.Name 
-                    && this.Version == modInfo.Version 
-                    && this.Category == modInfo.Category
-                    && this.FileName == modInfo.FileName)
-                    return true;
+                if (obj is ModInfo other)
+                {
+                    return Equals(other);
+                }
 
                 return false;
+            }
+
+            public bool Equals(ModInfo other)
+            {
+                return Name == other.Name && Version == other.Version && Category == other.Category && FileName == other.FileName;
+            }
+
+            public override int GetHashCode()
+            {
+                unchecked
+                {
+                    int hashCode = (Name != null ? Name.GetHashCode() : 0);
+                    hashCode = (hashCode * 397) ^ (Version != null ? Version.GetHashCode() : 0);
+                    hashCode = (hashCode * 397) ^ (Category != null ? Category.GetHashCode() : 0);
+                    return hashCode;
+                }
             }
         }
 
@@ -166,24 +294,21 @@ namespace Frosty.ModSupport
             }
         };
 
-        [DllImport("kernel32.dll")]
-        static extern bool CreateSymbolicLink(string lpSymlinkFileName, string lpTargetFileName, int dwFlags);
-
         private FileSystem fs;
         private ResourceManager rm;
         private AssetManager am;
-        private ILogger logger;
+        private FrostyTaskLogger logger;
 
         private List<string> addedSuperBundles = new List<string>();
 
-        private Dictionary<int, ModBundleInfo> modifiedBundles = new Dictionary<int, ModBundleInfo>();
-        private Dictionary<int, List<string>> addedBundles = new Dictionary<int, List<string>>();
+        private ConcurrentDictionary<int, ModBundleInfo> modifiedBundles = new ConcurrentDictionary<int, ModBundleInfo>();
+        private ConcurrentDictionary<int, HashSet<string>> addedBundles = new ConcurrentDictionary<int, HashSet<string>>();
 
-        private Dictionary<string, EbxAssetEntry> modifiedEbx = new Dictionary<string, EbxAssetEntry>();
-        private Dictionary<string, ResAssetEntry> modifiedRes = new Dictionary<string, ResAssetEntry>();
-        private Dictionary<Guid, ChunkAssetEntry> modifiedChunks = new Dictionary<Guid, ChunkAssetEntry>();
+        private ConcurrentDictionary<string, EbxAssetEntry> modifiedEbx = new ConcurrentDictionary<string, EbxAssetEntry>();
+        private ConcurrentDictionary<string, ResAssetEntry> modifiedRes = new ConcurrentDictionary<string, ResAssetEntry>();
+        private ConcurrentDictionary<Guid, ChunkAssetEntry> modifiedChunks = new ConcurrentDictionary<Guid, ChunkAssetEntry>();
 
-        private Dictionary<Sha1, ArchiveInfo> archiveData = new Dictionary<Sha1, ArchiveInfo>();
+        private ConcurrentDictionary<Sha1, ArchiveInfo> archiveData = new ConcurrentDictionary<Sha1, ArchiveInfo>();
         private int numArchiveEntries = 0;
         private int numTasks;
 
@@ -192,9 +317,9 @@ namespace Frosty.ModSupport
         private Dictionary<int, Dictionary<int, Dictionary<uint, CatResourceEntry>>> resources = new Dictionary<int, Dictionary<int, Dictionary<uint, CatResourceEntry>>>();
         private string modDirName = "ModData";
 
-        public ILogger Logger { get => logger; set => logger = value; }
+        public FrostyTaskLogger Logger { get => logger; set => logger = value; }
 
-        private Dictionary<int, Dictionary<uint, CatResourceEntry>> LoadCatalog(FileSystem fs, string filename, out int catFileHash)
+        private Dictionary<int, Dictionary<uint, CatResourceEntry>> LoadCatalog(string filename, out int catFileHash)
         {
             catFileHash = 0;
             string fullPath = fs.ResolvePath(filename);
@@ -217,6 +342,14 @@ namespace Frosty.ModSupport
             return resources;
         }
 
+        private void ReportProgress(int current, int total)
+        {
+            if (total > 0)
+            {
+                Logger.LogProgress(current / (float)total * 100d);
+            }
+        }
+
         private int HashBundle(BundleEntry bentry)
         {
             int hash = Fnv1.HashString(bentry.Name.ToLower());
@@ -226,98 +359,131 @@ namespace Frosty.ModSupport
 
             return hash;
         }
+
         private void ProcessModResources(IResourceContainer fmod)
         {
-            foreach (BaseModResource resource in fmod.Resources)
+            // Bundle whitelist may not contain the chunk bundle. This adds it to prevent issues
+            if (App.WhitelistedBundles.Count != 0)
             {
-                //try
+                App.WhitelistedBundles.Add(chunksBundleHash);
+            }
+
+            var processorCount = Math.Max(1, Environment.ProcessorCount / 2);
+
+            // FileLogger.Info($"Using {processorCount} processor cores.");
+
+            Parallel.ForEach(fmod.Resources, new ParallelOptions() { MaxDegreeOfParallelism = processorCount }, resource =>
+            {
+                // pull existing bundles from asset manager
+                HashSet<int> bundles = new HashSet<int>();
+
+                if (resource.Type == ModResourceType.Bundle)
                 {
-                    // pull existing bundles from asset manager
-                    List<int> bundles = new List<int>();
+                    BundleEntry bEntry = new BundleEntry();
+                    resource.FillAssetEntry(bEntry);
 
-                    if (resource.Type == ModResourceType.Bundle)
+                    addedBundles.TryAdd(bEntry.SuperBundleId, new HashSet<string>());
+
+                    lock (addedBundles[bEntry.SuperBundleId])
                     {
-                        BundleEntry bentry = new BundleEntry();
-                        resource.FillAssetEntry(bentry);
-
-                        if (!addedBundles.ContainsKey(bentry.SuperBundleId))
-                            addedBundles.Add(bentry.SuperBundleId, new List<string>());
-                        addedBundles[bentry.SuperBundleId].Add(bentry.Name);
-
+                        addedBundles[bEntry.SuperBundleId].Add(bEntry.Name);
                     }
-                    else if (resource.Type == ModResourceType.Ebx)
+                }
+                else if (resource.Type == ModResourceType.Ebx)
+                {
+                    if (resource.IsModified || !modifiedEbx.ContainsKey(resource.Name))
                     {
-                        if (resource.IsModified || !modifiedEbx.ContainsKey(resource.Name))
+                        if (resource.HasHandler)
                         {
-                            if (resource.HasHandler)
+                            HandlerExtraData extraData;
+                            byte[] data = fmod.GetResourceData(resource);
+
+                            if (modifiedEbx.TryGetValue(resource.Name, out EbxAssetEntry entry))
                             {
-                                EbxAssetEntry entry = null;
-                                HandlerExtraData extraData = null;
-                                byte[] data = fmod.GetResourceData(resource);
-
-                                if (modifiedEbx.ContainsKey(resource.Name))
-                                {
-                                    entry = modifiedEbx[resource.Name];
-                                    extraData = (HandlerExtraData)entry.ExtraData;
-                                }
-                                else
-                                {
-                                    entry = new EbxAssetEntry();
-                                    extraData = new HandlerExtraData();
-
-                                    resource.FillAssetEntry(entry);
-                                    // the rest of the chunk will be populated via the handler
-
-                                    ICustomActionHandler handler = App.PluginManager.GetCustomHandler((uint)resource.Handler);
-                                    if (handler != null)
-                                        extraData.Handler = handler;
-
-                                    // add in existing bundles
-                                    var ebxEntry = am.GetEbxEntry(resource.Name);
-                                    foreach (int bid in ebxEntry.Bundles)
-                                    {
-                                        bundles.Add(HashBundle(am.GetBundleEntry(bid)));
-                                    }
-
-                                    entry.ExtraData = extraData;
-                                    modifiedEbx.Add(resource.Name, entry);
-                                }
-
-                                // merge new and old data together
-                                if (extraData != null)
-                                    extraData.Data = extraData.Handler.Load(extraData.Data, data);
+                                extraData = (HandlerExtraData)entry.ExtraData;
                             }
                             else
                             {
-                                if (modifiedEbx.ContainsKey(resource.Name))
+                                entry = new EbxAssetEntry();
+                                extraData = new HandlerExtraData();
+
+                                resource.FillAssetEntry(entry);
+                                // the rest of the chunk will be populated via the handler
+
+                                ICustomActionHandler handler = App.PluginManager.GetCustomHandler((uint)resource.Handler);
+                                if (handler != null)
+                                    extraData.Handler = handler;
+
+                                // add in existing bundles
+                                var ebxEntry = am.GetEbxEntry(resource.Name);
+                                foreach (int bid in ebxEntry.Bundles)
                                 {
-                                    EbxAssetEntry existingEntry = modifiedEbx[resource.Name];
-
-                                    if (existingEntry.ExtraData != null)
-                                        continue;
-                                    if (existingEntry.Sha1 == resource.Sha1)
-                                        continue;
-
-                                    archiveData[existingEntry.Sha1].RefCount--;
-                                    if (archiveData[existingEntry.Sha1].RefCount == 0)
-                                        archiveData.Remove(existingEntry.Sha1);
-
-                                    modifiedEbx.Remove(resource.Name);
-                                    numArchiveEntries--;
+                                    bundles.Add(HashBundle(am.GetBundleEntry(bid)));
                                 }
 
-                                EbxAssetEntry entry = new EbxAssetEntry();
-                                resource.FillAssetEntry(entry);
+                                entry.ExtraData = extraData;
+                                modifiedEbx.TryAdd(resource.Name, entry);
+                            }
 
-                                byte[] data = fmod.GetResourceData(resource);
-                                var ebxEntry = am.GetEbxEntry(resource.Name);
+                            // merge new and old data together
+                            if (extraData != null)
+                                extraData.Data = extraData.Handler.Load(extraData.Data, data);
+                        }
+                        else
+                        {
+                            if (modifiedEbx.TryGetValue(resource.Name, out EbxAssetEntry existingEntry))
+                            {
+                                if (existingEntry.ExtraData != null)
+                                    goto label_add_bundles;
+                                if (existingEntry.Sha1 == resource.Sha1)
+                                    goto label_add_bundles;
 
-                                if (data == null)
+                                if (!archiveData.ContainsKey(existingEntry.Sha1))
                                 {
-                                    data = NativeReader.ReadInStream(am.GetRawStream(ebxEntry));
+                                    return;
+                                }
 
-                                    entry.Sha1 = ebxEntry.Sha1;
-                                    entry.OriginalSize = ebxEntry.OriginalSize;
+                                archiveData[existingEntry.Sha1].RefCount--;
+                                if (archiveData[existingEntry.Sha1].RefCount == 0)
+                                    archiveData.TryRemove(existingEntry.Sha1, out _);
+
+                                modifiedEbx.TryRemove(resource.Name, out _);
+                                numArchiveEntries--;
+                            }
+
+                            EbxAssetEntry entry = new EbxAssetEntry();
+                            resource.FillAssetEntry(entry);
+
+                            var archiveInfo = new ArchiveInfo() { RefCount = 1 };
+
+                            byte[] data = fmod.GetResourceData(resource);
+                            var ebxEntry = am.GetEbxEntry(resource.Name);
+
+                            if (data == null)
+                            {
+                                data = NativeReader.ReadInStream(am.GetRawStream(ebxEntry));
+
+                                if (data != null && data.Length > 0)
+                                {
+                                    archiveInfo.SetRawOrigin(am, ebxEntry);
+                                }
+                                else
+                                {
+                                    archiveInfo.Data = data;
+                                }
+
+                                entry.Sha1 = ebxEntry.Sha1;
+                                entry.OriginalSize = ebxEntry.OriginalSize;
+                            }
+                            else
+                            {
+                                if (data.Length > 0)
+                                {
+                                    archiveInfo.SetResourceOrigin(fmod, resource);
+                                }
+                                else
+                                {
+                                    archiveInfo.Data = data;
                                 }
 
                                 if (ebxEntry != null)
@@ -328,94 +494,119 @@ namespace Frosty.ModSupport
                                         bundles.Add(HashBundle(am.GetBundleEntry(bid)));
                                     }
                                 }
-
-                                entry.Size = data.Length;
-
-                                modifiedEbx.Add(entry.Name, entry);
-                                if (!archiveData.ContainsKey(entry.Sha1))
-                                    archiveData.Add(entry.Sha1, new ArchiveInfo() { Data = data, RefCount = 1 });
-                                else
-                                    archiveData[entry.Sha1].RefCount++;
-                                numArchiveEntries++;
                             }
+
+                            //archiveInfo.Data = data;
+                            entry.Size = data.Length;
+
+                            modifiedEbx.TryAdd(entry.Name, entry);
+                            if (!archiveData.TryAdd(entry.Sha1, archiveInfo))
+                            {
+                                archiveData[entry.Sha1].RefCount++;
+                            }
+
+                            numArchiveEntries++;
                         }
                     }
-                    else if (resource.Type == ModResourceType.Res)
+                }
+                else if (resource.Type == ModResourceType.Res)
+                {
+                    if (resource.IsModified || !modifiedRes.ContainsKey(resource.Name))
                     {
-                        if (resource.IsModified || !modifiedRes.ContainsKey(resource.Name))
+                        if (resource.HasHandler)
                         {
-                            if (resource.HasHandler)
+                            HandlerExtraData extraData;
+                            byte[] data = fmod.GetResourceData(resource);
+
+                            if (modifiedRes.TryGetValue(resource.Name, out ResAssetEntry entry))
                             {
-                                ResAssetEntry entry = null;
-                                HandlerExtraData extraData = null;
-                                byte[] data = fmod.GetResourceData(resource);
-
-                                if (modifiedRes.ContainsKey(resource.Name))
-                                {
-                                    entry = modifiedRes[resource.Name];
-                                    extraData = (HandlerExtraData)entry.ExtraData;
-                                }
-                                else
-                                {
-                                    entry = new ResAssetEntry();
-                                    extraData = new HandlerExtraData();
-
-                                    resource.FillAssetEntry(entry);
-                                    // the rest of the chunk will be populated via the handler
-
-                                    ICustomActionHandler handler = App.PluginManager.GetCustomHandler((ResourceType)entry.ResType);
-                                    if (handler != null)
-                                        extraData.Handler = handler;
-
-                                    // add in existing bundles
-                                    var resEntry = am.GetResEntry(resource.Name);
-                                    foreach (int bid in resEntry.Bundles)
-                                    {
-                                        bundles.Add(HashBundle(am.GetBundleEntry(bid)));
-                                    }
-
-                                    entry.ExtraData = extraData;
-                                    modifiedRes.Add(resource.Name, entry);
-                                }
-
-                                // merge new and old data together
-                                if (extraData != null)
-                                    extraData.Data = extraData.Handler.Load(extraData.Data, data);
+                                extraData = (HandlerExtraData)entry.ExtraData;
                             }
                             else
                             {
-                                if (modifiedRes.ContainsKey(resource.Name))
+                                entry = new ResAssetEntry();
+                                extraData = new HandlerExtraData();
+
+                                resource.FillAssetEntry(entry);
+                                // the rest of the chunk will be populated via the handler
+
+                                ICustomActionHandler handler = App.PluginManager.GetCustomHandler((ResourceType)entry.ResType);
+                                if (handler != null)
+                                    extraData.Handler = handler;
+
+                                // add in existing bundles
+                                var resEntry = am.GetResEntry(resource.Name);
+                                foreach (int bid in resEntry.Bundles)
                                 {
-                                    ResAssetEntry existingEntry = modifiedRes[resource.Name];
-
-                                    if (existingEntry.ExtraData != null)
-                                        continue;
-                                    if (existingEntry.Sha1 == resource.Sha1)
-                                        continue;
-
-                                    archiveData[existingEntry.Sha1].RefCount--;
-                                    if (archiveData[existingEntry.Sha1].RefCount == 0)
-                                        archiveData.Remove(existingEntry.Sha1);
-
-                                    modifiedRes.Remove(resource.Name);
-                                    numArchiveEntries--;
+                                    bundles.Add(HashBundle(am.GetBundleEntry(bid)));
                                 }
 
-                                ResAssetEntry entry = new ResAssetEntry();
-                                resource.FillAssetEntry(entry);
+                                entry.ExtraData = extraData;
+                                modifiedRes.TryAdd(resource.Name, entry);
+                            }
 
-                                byte[] data = fmod.GetResourceData(resource);
-                                var resEntry = am.GetResEntry(resource.Name);
+                            // merge new and old data together
+                            if (extraData != null)
+                                extraData.Data = extraData.Handler.Load(extraData.Data, data);
+                        }
+                        else
+                        {
+                            if (modifiedRes.TryGetValue(resource.Name, out ResAssetEntry existingEntry))
+                            {
+                                if (existingEntry.ExtraData != null)
+                                    goto label_add_bundles;
+                                if (existingEntry.Sha1 == resource.Sha1)
+                                    goto label_add_bundles;
 
-                                if (data == null)
+                                if (!archiveData.ContainsKey(existingEntry.Sha1))
                                 {
-                                    data = NativeReader.ReadInStream(am.GetRawStream(resEntry));
+                                    return;
+                                }
 
-                                    entry.Sha1 = resEntry.Sha1;
-                                    entry.OriginalSize = resEntry.OriginalSize;
-                                    entry.ResMeta = resEntry.ResMeta;
-                                    entry.ResRid = resEntry.ResRid;
-                                    entry.ResType = resEntry.ResType;
+                                archiveData[existingEntry.Sha1].RefCount--;
+                                if (archiveData[existingEntry.Sha1].RefCount == 0)
+                                    archiveData.TryRemove(existingEntry.Sha1, out _);
+
+                                modifiedRes.TryRemove(resource.Name, out _);
+                                numArchiveEntries--;
+                            }
+
+                            ResAssetEntry entry = new ResAssetEntry();
+                            resource.FillAssetEntry(entry);
+
+                            var archiveInfo = new ArchiveInfo() { RefCount = 1 };
+
+                            byte[] data = fmod.GetResourceData(resource);
+                            var resEntry = am.GetResEntry(resource.Name);
+
+                            if (data == null)
+                            {
+                                data = NativeReader.ReadInStream(am.GetRawStream(resEntry));
+                                
+                                if (data != null && data.Length > 0)
+                                {
+                                    archiveInfo.SetRawOrigin(am, resEntry);
+                                }
+                                else
+                                {
+                                    archiveInfo.Data = data;
+                                }
+
+                                entry.Sha1 = resEntry.Sha1;
+                                entry.OriginalSize = resEntry.OriginalSize;
+                                entry.ResMeta = resEntry.ResMeta;
+                                entry.ResRid = resEntry.ResRid;
+                                entry.ResType = resEntry.ResType;
+                            }
+                            else 
+                            {
+                                if (data.Length > 0)
+                                {
+                                    archiveInfo.SetResourceOrigin(fmod, resource);
+                                }
+                                else
+                                {
+                                    archiveInfo.Data = data;
                                 }
 
                                 if (resEntry != null)
@@ -426,153 +617,180 @@ namespace Frosty.ModSupport
                                         bundles.Add(HashBundle(am.GetBundleEntry(bid)));
                                     }
                                 }
-
-                                entry.Size = data.Length;
-
-                                modifiedRes.Add(entry.Name, entry);
-                                if (!archiveData.ContainsKey(entry.Sha1))
-                                    archiveData.Add(entry.Sha1, new ArchiveInfo() { Data = data, RefCount = 1 });
-                                else
-                                    archiveData[entry.Sha1].RefCount++;
-                                numArchiveEntries++;
                             }
+
+                            //archiveInfo.Data = data;
+                            entry.Size = data.Length;
+
+                            modifiedRes.TryAdd(entry.Name, entry);
+                            if (!archiveData.TryAdd(entry.Sha1, archiveInfo))
+                                archiveData[entry.Sha1].RefCount++;
+                            numArchiveEntries++;
                         }
                     }
-                    else if (resource.Type == ModResourceType.Chunk)
+                }
+                else if (resource.Type == ModResourceType.Chunk)
+                {
+                    Guid guid = new Guid(resource.Name);
+                    if (resource.IsModified || !modifiedChunks.ContainsKey(guid))
                     {
-                        Guid guid = new Guid(resource.Name);
-                        if (resource.IsModified || !modifiedChunks.ContainsKey(guid))
+                        if (resource.HasHandler)
                         {
-                            if (resource.HasHandler)
+                            HandlerExtraData extraData;
+                            byte[] data = fmod.GetResourceData(resource);
+
+                            if (modifiedChunks.TryGetValue(guid, out ChunkAssetEntry entry))
                             {
-                                ChunkAssetEntry entry = null;
-                                HandlerExtraData extraData = null;
-                                byte[] data = fmod.GetResourceData(resource);
-
-                                if (modifiedChunks.ContainsKey(guid))
-                                {
-                                    entry = modifiedChunks[guid];
-                                    extraData = (HandlerExtraData)entry.ExtraData;
-                                }
-                                else
-                                {
-                                    entry = new ChunkAssetEntry();
-                                    extraData = new HandlerExtraData();
-
-                                    entry.Id = guid;
-                                    entry.IsTocChunk = resource.IsTocChunk;
-                                    // the rest of the chunk will be populated via the handler
-
-                                    if ((uint)resource.Handler == 0xBD9BFB65)
-                                    {
-                                        // hack to ensure handler for legacy assets is set properly
-                                        extraData.Handler = new Frosty.Core.Handlers.LegacyCustomActionHandler();
-                                    }
-                                    else
-                                    {
-                                        ICustomActionHandler handler = App.PluginManager.GetCustomHandler((uint)resource.Handler);
-                                        if (handler != null)
-                                            extraData.Handler = handler;
-                                    }
-
-                                    // add in existing bundles
-                                    var chunkEntry = am.GetChunkEntry(guid);
-                                    bundles.Add(chunksBundleHash);
-                                    foreach (int bid in chunkEntry.Bundles)
-                                    {
-                                        bundles.Add(HashBundle(am.GetBundleEntry(bid)));
-                                    }
-
-                                    entry.ExtraData = extraData;
-                                    modifiedChunks.Add(guid, entry);
-                                }
-
-                                // merge new and old data together
-                                extraData.Data = extraData.Handler.Load(extraData.Data, data);
+                                extraData = (HandlerExtraData)entry.ExtraData;
                             }
                             else
                             {
-                                if (modifiedChunks.ContainsKey(guid))
+                                entry = new ChunkAssetEntry();
+                                extraData = new HandlerExtraData();
+
+                                entry.Id = guid;
+                                entry.IsTocChunk = resource.IsTocChunk;
+                                // the rest of the chunk will be populated via the handler
+
+                                if ((uint)resource.Handler == 0xBD9BFB65)
                                 {
-                                    ChunkAssetEntry existingEntry = modifiedChunks[guid];
-                                    if (existingEntry.Sha1 == resource.Sha1)
-                                        continue;
-
-                                    archiveData[existingEntry.Sha1].RefCount--;
-                                    if (archiveData[existingEntry.Sha1].RefCount == 0)
-                                        archiveData.Remove(existingEntry.Sha1);
-
-                                    modifiedChunks.Remove(guid);
-                                    numArchiveEntries--;
+                                    // hack to ensure handler for legacy assets is set properly
+                                    extraData.Handler = new Frosty.Core.Handlers.LegacyCustomActionHandler();
+                                }
+                                else
+                                {
+                                    ICustomActionHandler handler = App.PluginManager.GetCustomHandler((uint)resource.Handler);
+                                    if (handler != null)
+                                        extraData.Handler = handler;
                                 }
 
-                                ChunkAssetEntry entry = new ChunkAssetEntry();
-                                resource.FillAssetEntry(entry);
-
-                                byte[] data = fmod.GetResourceData(resource);
+                                // add in existing bundles
                                 var chunkEntry = am.GetChunkEntry(guid);
-
-                                if (data == null)
+                                bundles.Add(chunksBundleHash);
+                                foreach (int bid in chunkEntry.Bundles)
                                 {
-                                    data = NativeReader.ReadInStream(am.GetRawStream(chunkEntry));
+                                    bundles.Add(HashBundle(am.GetBundleEntry(bid)));
+                                }
 
-                                    entry.Sha1 = (chunkEntry.Sha1 == Sha1.Zero) ? Utils.GenerateSha1(data) : chunkEntry.Sha1;
-                                    entry.OriginalSize = chunkEntry.OriginalSize;
-                                    entry.LogicalSize = chunkEntry.LogicalSize;
-                                    entry.LogicalOffset = chunkEntry.LogicalOffset;
-                                    entry.RangeStart = chunkEntry.RangeStart;
-                                    entry.RangeEnd = chunkEntry.RangeEnd;
+                                entry.ExtraData = extraData;
+                                modifiedChunks.TryAdd(guid, entry);
+                            }
 
-                                    if (ProfilesLibrary.DataVersion == (int)ProfileVersion.StarWarsBattlefrontII)
+                            // merge new and old data together
+                            extraData.Data = extraData.Handler.Load(extraData.Data, data);
+                        }
+                        else
+                        {
+                            if (modifiedChunks.TryGetValue(guid, out ChunkAssetEntry existingEntry))
+                            {
+                                if (existingEntry.ExtraData != null)
+                                    goto label_add_bundles;
+                                if (existingEntry.Sha1 == resource.Sha1)
+                                    goto label_add_bundles;
+
+                                if (!archiveData.ContainsKey(existingEntry.Sha1))
+                                {
+                                    return;
+                                }
+
+                                archiveData[existingEntry.Sha1].RefCount--;
+                                if (archiveData[existingEntry.Sha1].RefCount == 0)
+                                    archiveData.TryRemove(existingEntry.Sha1, out _);
+
+                                modifiedChunks.TryRemove(guid, out _);
+                                numArchiveEntries--;
+                            }
+
+                            ChunkAssetEntry entry = new ChunkAssetEntry();
+                            resource.FillAssetEntry(entry);
+
+                            var archiveInfo = new ArchiveInfo() { RefCount = 1 };
+
+                            byte[] data = fmod.GetResourceData(resource);
+                            var chunkEntry = am.GetChunkEntry(guid);
+
+                            if (data == null)
+                            {
+                                data = NativeReader.ReadInStream(am.GetRawStream(chunkEntry));
+
+                                if (data != null && data.Length > 0)
+                                {
+                                    archiveInfo.SetRawOrigin(am, chunkEntry);
+                                }
+                                else
+                                {
+                                    archiveInfo.Data = data;
+                                }
+
+                                entry.Sha1 = (chunkEntry.Sha1 == Sha1.Zero) ? Utils.GenerateSha1(data) : chunkEntry.Sha1;
+                                entry.OriginalSize = chunkEntry.OriginalSize;
+                                entry.LogicalSize = chunkEntry.LogicalSize;
+                                entry.LogicalOffset = chunkEntry.LogicalOffset;
+                                entry.RangeStart = chunkEntry.RangeStart;
+                                entry.RangeEnd = chunkEntry.RangeEnd;
+
+                                if (chunkEntry.LogicalOffset != 0 && chunkEntry.RangeStart == 0)
+                                {
+                                    // need to calculate range start, since manifest bundle layouts don't store it directly
+                                    // however it is used to store chunk portions in bundles
+                                    // @todo: Move to mod export
+
+                                    using (NativeReader reader = new NativeReader(new MemoryStream(data)))
                                     {
-                                        if (fs.GetManifestChunk(chunkEntry.Id) != null)
+                                        long uncompressedSize = entry.LogicalOffset + entry.LogicalSize;
+                                        long uncompressedBundledSize = (entry.LogicalOffset & 0xFFFF) | entry.LogicalSize;
+                                        long logicalOffset = uncompressedSize - uncompressedBundledSize;
+                                        uint size = 0;
+
+                                        while (true)
                                         {
-                                            entry.TocChunkSpecialHack = true;
-                                            if (chunkEntry.Bundles.Count == 0)
-                                                resource.ClearAddedBundles();
+                                            int decompressedSize = reader.ReadInt(Endian.Big);
+                                            ushort compressionType = reader.ReadUShort();
+                                            int bufferSize = reader.ReadUShort(Endian.Big);
 
-                                            else if (entry.FirstMip != -1)
-                                            {
-                                                // need to calculate range start, since manifest bundle layouts don't store it directly
-                                                // however it is used to store chunk portions in bundles
-                                                // @todo: Move to mod export
+                                            int flags = ((compressionType & 0xFF00) >> 8);
 
-                                                using (NativeReader reader = new NativeReader(new MemoryStream(data)))
-                                                {
-                                                    long logicalOffset = entry.LogicalOffset;
-                                                    uint size = 0;
+                                            if ((flags & 0x0F) != 0)
+                                                bufferSize = ((flags & 0x0F) << 0x10) + bufferSize;
+                                            if ((decompressedSize & 0xFF000000) != 0)
+                                                decompressedSize &= 0x00FFFFFF;
 
-                                                    while (true)
-                                                    {
-                                                        int decompressedSize = reader.ReadInt(Endian.Big);
-                                                        ushort compressionType = reader.ReadUShort();
-                                                        int bufferSize = reader.ReadUShort(Endian.Big);
+                                            logicalOffset -= decompressedSize;
+                                            if (logicalOffset < 0)
+                                                break;
 
-                                                        int flags = ((compressionType & 0xFF00) >> 8);
+                                            compressionType = (ushort)(compressionType & 0x7F);
+                                            if (compressionType == 0x00)
+                                                bufferSize = decompressedSize;
 
-                                                        if ((flags & 0x0F) != 0)
-                                                            bufferSize = ((flags & 0x0F) << 0x10) + bufferSize;
-                                                        if ((decompressedSize & 0xFF000000) != 0)
-                                                            decompressedSize &= 0x00FFFFFF;
-
-                                                        logicalOffset -= decompressedSize;
-                                                        if(logicalOffset < 0)
-                                                            break;
-
-                                                        compressionType = (ushort)(compressionType & 0x7F);
-                                                        if (compressionType == 0x00)
-                                                            bufferSize = decompressedSize;
-
-                                                        size += (uint)(bufferSize + 8);
-                                                        reader.Position += bufferSize;
-                                                    }
-
-                                                    entry.RangeStart = size;
-                                                    entry.RangeEnd = (uint)data.Length;
-                                                }
-                                            }
+                                            size += (uint)(bufferSize + 8);
+                                            reader.Position += bufferSize;
                                         }
+
+                                        entry.RangeStart = size;
+                                        entry.RangeEnd = (uint)data.Length;
                                     }
+                                }
+
+                                if (ProfilesLibrary.DataVersion == (int)ProfileVersion.StarWarsBattlefrontII || ProfilesLibrary.DataVersion == (int)ProfileVersion.Battlefield5)
+                                {
+                                    if (fs.GetManifestChunk(chunkEntry.Id) != null)
+                                    {
+                                        entry.TocChunkSpecialHack = true;
+                                        if (chunkEntry.Bundles.Count == 0)
+                                            resource.ClearAddedBundles();
+                                    }
+                                }
+                            }
+                            else 
+                            {
+                                if (data.Length > 0)
+                                {
+                                    archiveInfo.SetResourceOrigin(fmod, resource);
+                                }
+                                else
+                                {
+                                    archiveInfo.Data = data;
                                 }
 
                                 if (chunkEntry != null)
@@ -584,87 +802,516 @@ namespace Frosty.ModSupport
                                         bundles.Add(HashBundle(am.GetBundleEntry(bid)));
                                     }
                                 }
-
-                                entry.Size = data.Length;
-
-                                modifiedChunks.Add(guid, entry);
-                                if (!archiveData.ContainsKey(entry.Sha1))
-                                    archiveData.Add(entry.Sha1, new ArchiveInfo() { Data = data, RefCount = 1 });
-                                else
-                                    archiveData[entry.Sha1].RefCount++;
-                                numArchiveEntries++;
                             }
+
+                            entry.Size = data.Length;
+
+                            modifiedChunks.TryAdd(guid, entry);
+                            if (!archiveData.TryAdd(entry.Sha1, archiveInfo))
+                                archiveData[entry.Sha1].RefCount++;
+                            numArchiveEntries++;
+                        }
+                    }
+                    else
+                    {
+                        if (ProfilesLibrary.DataVersion == (int)ProfileVersion.StarWarsBattlefrontII || ProfilesLibrary.DataVersion == (int)ProfileVersion.Battlefield5)
+                        {
+                            var chunkEntry = am.GetChunkEntry(guid);
+                            var entry = modifiedChunks[guid];
+
+                            if (fs.GetManifestChunk(chunkEntry.Id) != null)
+                            {
+                                entry.TocChunkSpecialHack = true;
+                                if (chunkEntry.Bundles.Count == 0)
+                                    resource.ClearAddedBundles();
+                            }
+                        }
+                    }
+                }
+
+                // modified bundle actions (these are pulled from the asset manager during applying)
+                foreach (int bundleHash in bundles)
+                {
+                    // Skips bundle if the whitelist has more than one element and doesn't contain the bundle hash
+                    if (App.WhitelistedBundles.Count != 0 && !App.WhitelistedBundles.Contains(bundleHash))
+                    {
+                        continue;
+                    }
+
+                    modifiedBundles.TryAdd(bundleHash, new ModBundleInfo() { Name = bundleHash });
+
+                    ModBundleInfo modBundle = modifiedBundles[bundleHash];
+                    switch (resource.Type)
+                    {
+                        case ModResourceType.Ebx: modBundle.Modify.AddEbx(resource.Name); break;
+                        case ModResourceType.Res: modBundle.Modify.AddRes(resource.Name); break;
+                        case ModResourceType.Chunk: modBundle.Modify.AddChunk(new Guid(resource.Name)); break;
+                    }
+                }
+                
+                label_add_bundles:
+                // add bundle actions (these are stored in the mod)
+                foreach (int bundleHash in resource.AddedBundles)
+                {
+                    // Skips bundle if the whitelist has more than one element and doesn't contain the bundle hash
+                    if (App.WhitelistedBundles.Count != 0 && !App.WhitelistedBundles.Contains(bundleHash))
+                    {
+                        continue;
+                    }
+
+                    modifiedBundles.TryAdd(bundleHash, new ModBundleInfo() { Name = bundleHash });
+
+                    ModBundleInfo modBundle = modifiedBundles[bundleHash];
+                    switch (resource.Type)
+                    {
+                        case ModResourceType.Ebx: modBundle.Add.AddEbx(resource.Name); break;
+                        case ModResourceType.Res: modBundle.Add.AddRes(resource.Name); break;
+                        case ModResourceType.Chunk: modBundle.Add.AddChunk(new Guid(resource.Name)); break;
+                    }
+                }
+            });
+        }
+
+        private void ProcessLegacyModResources(string modPath)
+        {
+            DbObject mod = null;
+            using (DbReader reader = new DbReader(new FileStream(modPath, FileMode.Open, FileAccess.Read), null))
+                mod = reader.ReadDbObject();
+
+            string magic = mod.GetValue<string>("magic");
+            int ver = int.Parse(magic.Replace("FBMODV", ""));
+
+            // obtain bundles to modify
+            DbObject resourceList = mod.GetValue<DbObject>("resources");
+            foreach (DbObject action in mod.GetValue<DbObject>("actions"))
+            {
+                int bundle = Fnv1.HashString(action.GetValue<string>("bundle").ToLower());
+                string actionType = action.GetValue<string>("type");
+                int resourceId = action.GetValue<int>("resourceId");
+
+                if (!modifiedBundles.ContainsKey(bundle))
+                    modifiedBundles.TryAdd(bundle, new ModBundleInfo() { Name = bundle });
+
+                ModBundleInfo modBundle = modifiedBundles[bundle];
+                DbObject resource = resourceList[resourceId] as DbObject;
+
+                string resName = resource.GetValue<string>("name");
+                string resType = resource.GetValue<string>("type");
+
+                if (actionType == "modify")
+                {
+                    switch (resType)
+                    {
+                        case "ebx": modBundle.Modify.Ebx.Add(resName); break;
+                        case "res": modBundle.Modify.Res.Add(resName); break;
+                        case "chunk": modBundle.Modify.Chunks.Add(new Guid(resName)); break;
+                    }
+                }
+                else if (actionType == "add")
+                {
+                    switch (resType)
+                    {
+                        case "ebx": modBundle.Add.Ebx.Add(resName); break;
+                        case "res": modBundle.Add.Res.Add(resName); break;
+                        case "chunk": modBundle.Add.Chunks.Add(new Guid(resName)); break;
+                    }
+                }
+                else if (actionType == "remove")
+                {
+                    switch (resType)
+                    {
+                        case "ebx": modBundle.Remove.Ebx.Add(resName); break;
+                        case "res": modBundle.Remove.Res.Add(resName); break;
+                        case "chunk": modBundle.Remove.Chunks.Add(new Guid(resName)); break;
+                    }
+                }
+            }
+
+            // obtain resources to modify
+            foreach (DbObject resource in resourceList)
+            {
+                string resourceType = resource.GetValue<string>("type");
+                if (resourceType == "superbundle")
+                {
+                    string name = resource.GetValue<string>("name");
+                    addedSuperBundles.Add(name);
+                }
+                else if (resourceType == "bundle")
+                {
+                    string name = resource.GetValue<string>("name");
+                    string superBundle = resource.GetValue<string>("sb");
+
+                    int hash = Fnv1a.HashString(superBundle.ToLower());
+                    if (!addedBundles.ContainsKey(hash))
+                        addedBundles.TryAdd(hash, new HashSet<string>());
+
+                    addedBundles[hash].Add(name);
+                }
+                else if (resourceType == "ebx")
+                {
+                    string name = resource.GetValue<string>("name");
+
+                    if (modifiedEbx.ContainsKey(name))
+                    {
+                        EbxAssetEntry existingEntry = modifiedEbx[name];
+                        if (existingEntry.Sha1 == resource.GetValue<Sha1>("sha1"))
+                            continue;
+
+                        if (!archiveData.ContainsKey(existingEntry.Sha1))
+                        {
+                            continue;
+                        }
+
+                        archiveData[existingEntry.Sha1].RefCount--;
+                        if (archiveData[existingEntry.Sha1].RefCount == 0)
+                            archiveData.TryRemove(existingEntry.Sha1, out _);
+
+                        modifiedEbx.TryRemove(name, out _);
+                        numArchiveEntries--;
+                    }
+
+                    EbxAssetEntry entry = new EbxAssetEntry
+                    {
+                        Name = name,
+                        OriginalSize = resource.GetValue<long>("uncompressedSize"),
+                        Size = resource.GetValue<long>("compressedSize")
+                    };
+
+                    var archiveInfo = new ArchiveInfo() { RefCount = 1 };
+
+                    byte[] buffer = null;
+                    if (resource.HasValue("archiveIndex"))
+                    {
+                        entry.IsInline = resource.GetValue<bool>("shouldInline");
+                        buffer = GetResourceData(modPath, resource.GetValue<int>("archiveIndex"), resource.GetValue<long>("archiveOffset"), (int)entry.Size);
+                        
+                        if (buffer != null && buffer.Length > 0)
+                        {
+                            archiveInfo.SetLegacyResourceOrigin(modPath, resource, entry);
                         }
                         else
                         {
-                            if (ProfilesLibrary.DataVersion == (int)ProfileVersion.StarWarsBattlefrontII)
-                            {
-                                var chunkEntry = am.GetChunkEntry(guid);
-                                var entry = modifiedChunks[guid];
+                            archiveInfo.Data = buffer;
+                        }
+                    }
+                    else
+                    {
+                        ManifestFileRef fileRef = resource.GetValue<int>("file");
+                        long offset = resource.GetValue<int>("offset");
 
-                                if (fs.GetManifestChunk(chunkEntry.Id) != null)
+                        using (NativeReader reader = new NativeReader(new FileStream(fs.ResolvePath(fileRef), FileMode.Open, FileAccess.Read)))
+                        {
+                            reader.Position = offset;
+                            buffer = reader.ReadBytes((int)entry.Size);
+                        }
+
+                        if (buffer != null && buffer.Length > 0)
+                        {
+                            archiveInfo.SetLegacyRawOrigin(fs, fileRef, offset, entry);
+                        }
+                        else
+                        {
+                            archiveInfo.Data = buffer;
+                        }
+                    }
+
+                    //archiveInfo.Data = buffer;
+                    entry.Sha1 = Utils.GenerateSha1(buffer);
+
+                    modifiedEbx.TryAdd(entry.Name, entry);
+                    if (!archiveData.ContainsKey(entry.Sha1))
+                        archiveData.TryAdd(entry.Sha1, archiveInfo);
+                    else
+                        archiveData[entry.Sha1].RefCount++;
+                    numArchiveEntries++;
+                }
+                else if (resourceType == "res")
+                {
+                    string name = resource.GetValue<string>("name");
+
+                    if (modifiedRes.ContainsKey(name))
+                    {
+                        ResAssetEntry existingEntry = modifiedRes[name];
+                        if (existingEntry.Sha1 == resource.GetValue<Sha1>("sha1"))
+                            continue;
+
+                        if (!archiveData.ContainsKey(existingEntry.Sha1))
+                        {
+                            continue;
+                        }
+
+                        archiveData[existingEntry.Sha1].RefCount--;
+                        if (archiveData[existingEntry.Sha1].RefCount == 0)
+                            archiveData.TryRemove(existingEntry.Sha1, out _);
+
+                        modifiedRes.TryRemove(name, out _);
+                        numArchiveEntries--;
+                    }
+
+                    ResAssetEntry entry = new ResAssetEntry
+                    {
+                        Name = name,
+                        OriginalSize = resource.GetValue<long>("uncompressedSize"),
+                        Size = resource.GetValue<long>("compressedSize"),
+                        ResRid = (ulong)resource.GetValue<long>("resRid"),
+                        ResType = (uint)resource.GetValue<int>("resType"),
+                        ResMeta = resource.GetValue<byte[]>("resMeta")
+                    };
+
+                    var archiveInfo = new ArchiveInfo() { RefCount = 1 };
+
+                    byte[] buffer = null;
+                    if (resource.HasValue("archiveIndex"))
+                    {
+                        entry.IsInline = resource.GetValue<bool>("shouldInline");
+                        buffer = GetResourceData(modPath, resource.GetValue<int>("archiveIndex"), resource.GetValue<long>("archiveOffset"), (int)entry.Size);
+                        
+                        if (buffer != null && buffer.Length > 0)
+                        {
+                            archiveInfo.SetLegacyResourceOrigin(modPath, resource, entry);
+                        }
+                        else
+                        {
+                            archiveInfo.Data = buffer;
+                        }
+                    }
+                    else
+                    {
+                        ManifestFileRef fileRef = resource.GetValue<int>("file");
+                        long offset = resource.GetValue<int>("offset");
+
+                        using (NativeReader reader = new NativeReader(new FileStream(fs.ResolvePath(fileRef), FileMode.Open, FileAccess.Read)))
+                        {
+                            reader.Position = offset;
+                            buffer = reader.ReadBytes((int)entry.Size);
+                        }
+
+                        if (buffer != null && buffer.Length > 0)
+                        {
+                            archiveInfo.SetLegacyRawOrigin(fs, fileRef, offset, entry);
+                        }
+                        else
+                        {
+                            archiveInfo.Data = buffer;
+                        }
+                    }
+
+                    entry.Sha1 = Utils.GenerateSha1(buffer);
+
+                    modifiedRes.TryAdd(entry.Name, entry);
+                    if (!archiveData.ContainsKey(entry.Sha1))
+                        archiveData.TryAdd(entry.Sha1, archiveInfo);
+                    else
+                        archiveData[entry.Sha1].RefCount++;
+                    numArchiveEntries++;
+                }
+                else if (resourceType == "chunk")
+                {
+                    Guid chunkId = new Guid(resource.GetValue<string>("name"));
+                    if (modifiedChunks.ContainsKey(chunkId))
+                    {
+                        ChunkAssetEntry existingEntry = modifiedChunks[chunkId];
+                        if (existingEntry.Sha1 == resource.GetValue<Sha1>("sha1"))
+                            continue;
+
+                        if (!archiveData.ContainsKey(existingEntry.Sha1))
+                        {
+                            continue;
+                        }
+
+                        archiveData[existingEntry.Sha1].RefCount--;
+                        if (archiveData[existingEntry.Sha1].RefCount == 0)
+                            archiveData.TryRemove(existingEntry.Sha1, out _);
+
+                        modifiedChunks.TryRemove(chunkId, out _);
+                        numArchiveEntries--;
+                    }
+
+                    ChunkAssetEntry entry = new ChunkAssetEntry
+                    {
+                        Id = chunkId,
+                        Size = resource.GetValue<long>("compressedSize"),
+                        LogicalOffset = resource.GetValue<uint>("logicalOffset"),
+                        LogicalSize = resource.GetValue<uint>("logicalSize"),
+                        RangeStart = resource.GetValue<uint>("rangeStart"),
+                        RangeEnd = resource.GetValue<uint>("rangeEnd"),
+                        FirstMip = resource.GetValue<int>("firstMip", -1),
+                        H32 = resource.GetValue<int>("h32", 0),
+                        IsTocChunk = resource.GetValue<bool>("tocChunk")
+                    };
+
+                    var archiveInfo = new ArchiveInfo() { RefCount = 1 };
+
+                    byte[] buffer = null;
+                    if (resource.HasValue("archiveIndex"))
+                    {
+                        // obtain data from archive
+                        entry.IsInline = resource.GetValue<bool>("shouldInline", false);
+                        buffer = GetResourceData(modPath, resource.GetValue<int>("archiveIndex"), resource.GetValue<long>("archiveOffset"), (int)entry.Size);
+                        
+                        if (buffer != null && buffer.Length > 0)
+                        {
+                            archiveInfo.SetLegacyResourceOrigin(modPath, resource, entry);
+                        }
+                        else
+                        {
+                            archiveInfo.Data = buffer;
+                        }
+                    }
+                    else
+                    {
+                        ManifestFileRef fileRef = resource.GetValue<int>("file");
+                        long offset = resource.GetValue<int>("offset");
+
+                        // obtain data from cas file location
+                        using (NativeReader reader = new NativeReader(new FileStream(fs.ResolvePath(fileRef), FileMode.Open, FileAccess.Read)))
+                        {
+                            reader.Position = offset;
+                            buffer = reader.ReadBytes((int)entry.Size);
+                        }
+
+                        if (buffer != null && buffer.Length > 0)
+                        {
+                            archiveInfo.SetLegacyRawOrigin(fs, fileRef, offset, entry);
+                        }
+                        else
+                        {
+                            archiveInfo.Data = buffer;
+                        }
+
+                        if (ProfilesLibrary.DataVersion == (int)ProfileVersion.StarWarsBattlefrontII || ProfilesLibrary.DataVersion == (int)ProfileVersion.Battlefield5)
+                        {
+                            if (entry.LogicalOffset != 0)
+                            {
+                                // calculate range values from cas data
+                                using (NativeReader reader = new NativeReader(new MemoryStream(buffer)))
                                 {
-                                    entry.TocChunkSpecialHack = true;
-                                    if (chunkEntry.Bundles.Count == 0)
-                                        resource.ClearAddedBundles();
+                                    int totalSize = 0;
+                                    while (totalSize != entry.LogicalOffset)
+                                    {
+                                        int uncompressedSize = reader.ReadInt(Endian.Big);
+                                        ushort compressCode = reader.ReadUShort(Endian.Big);
+                                        ushort blockSize = reader.ReadUShort(Endian.Big);
+
+                                        totalSize += uncompressedSize;
+                                        if (totalSize > entry.LogicalOffset)
+                                        {
+                                            reader.Position -= 8;
+                                            break;
+                                        }
+
+                                        reader.Position += blockSize;
+                                    }
+
+                                    entry.RangeStart = (uint)reader.Position;
+                                    entry.RangeEnd = (uint)buffer.Length;
                                 }
                             }
                         }
                     }
 
-                    // modified bundle actions (these are pulled from the asset manager during applying)
-                    foreach (int bundleHash in bundles)
-                    {
-                        if (!modifiedBundles.ContainsKey(bundleHash))
-                            modifiedBundles.Add(bundleHash, new ModBundleInfo() { Name = bundleHash });
+                    entry.Sha1 = Utils.GenerateSha1(buffer);
 
-                        ModBundleInfo modBundle = modifiedBundles[bundleHash];
-                        switch (resource.Type)
+                    modifiedChunks.TryAdd(entry.Id, entry);
+                    if (!archiveData.ContainsKey(entry.Sha1))
+                        archiveData.TryAdd(entry.Sha1, archiveInfo);
+                    else
+                        archiveData[entry.Sha1].RefCount++;
+                    numArchiveEntries++;
+
+                    if (ver < 2)
+                    {
+                        // previous mod format versions had no action listed for toc chunk changes
+                        // so now have to manually add an action for it.
+                        if (!modifiedBundles.ContainsKey(chunksBundleHash))
+                            modifiedBundles.TryAdd(chunksBundleHash, new ModBundleInfo() { Name = chunksBundleHash });
+                        ModBundleInfo chunksBundle = modifiedBundles[chunksBundleHash];
+                        chunksBundle.Modify.Chunks.Add(entry.Id);
+
+                        // new code requires first mip to be set to modify range values, however
+                        // old mods didnt modify this. So lets force it, hopefully not too many
+                        // issues result from this.
+                        entry.FirstMip = 0;
+                    }
+                    else if (ver == 3 && entry.FirstMip != -1)
+                    {
+                        // if mod is converted from daimod it needs to be added to the toc if its a texture chunk
+                        if (!modifiedBundles.ContainsKey(chunksBundleHash))
                         {
-                            case ModResourceType.Ebx: modBundle.Modify.AddEbx(resource.Name); break;
-                            case ModResourceType.Res: modBundle.Modify.AddRes(resource.Name); break;
-                            case ModResourceType.Chunk: modBundle.Modify.AddChunk(new Guid(resource.Name)); break;
+                            modifiedBundles.TryAdd(chunksBundleHash, new ModBundleInfo() { Name = chunksBundleHash });
                         }
+
+                        ModBundleInfo chunksBundle = modifiedBundles[chunksBundleHash];
+                        chunksBundle.Add.Chunks.Add(entry.Id);
                     }
 
-                    // add bundle actions (these are stored in the mod)
-                    foreach (int bundleHash in resource.AddedBundles)
-                    {
-                        if (!modifiedBundles.ContainsKey(bundleHash))
-                            modifiedBundles.Add(bundleHash, new ModBundleInfo() { Name = bundleHash });
-
-                        ModBundleInfo modBundle = modifiedBundles[bundleHash];
-                        switch (resource.Type)
-                        {
-                            case ModResourceType.Ebx: modBundle.Add.AddEbx(resource.Name); break;
-                            case ModResourceType.Res: modBundle.Add.AddRes(resource.Name); break;
-                            case ModResourceType.Chunk: modBundle.Add.AddChunk(new Guid(resource.Name)); break;
-                        }
-                    }
+                    if (entry.FirstMip == -1 && entry.RangeEnd != 0)
+                        entry.FirstMip = 0;
                 }
-                //catch (Exception ex)
-                //{
-
-                //}
             }
         }
 
-        public int Run(FileSystem inFs, CancellationToken cancelToken, ILogger inLogger, string rootPath, string modPackName, string additionalArgs, params string[] modPaths)
+        private bool ValidateWorkingDirAccess(string dir)
         {
-            modDirName = "ModData\\" + modPackName;
-            cancelToken.ThrowIfCancellationRequested();
+            try
+            {
+                var filePath = Path.Combine(dir, "test.test");
 
-            fs = inFs;
-            Logger = inLogger;
+                if (File.Exists(filePath))
+                {
+                    File.Delete(filePath);
+                }
 
-            string modPath = fs.BasePath + modDirName + "\\";
+                var sw = File.CreateText(filePath);
+                sw.WriteLine("test");
+
+                sw.Close();
+
+                var res = File.ReadAllText(filePath);
+
+                if (!res.Contains("test"))
+                {
+                    return false;
+                }
+
+                File.Delete(filePath);
+            }
+            catch
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        private int InstallMods(CancellationToken cancelToken, string rootPath, string modDataPath, string modPackName, params string[] modPaths)
+        {
+            FileLogger.Init();
+
+            FileLogger.Info("Starting mod installation.");
+
+            if (!ValidateWorkingDirAccess(fs.BasePath))
+            {
+                return -3;
+            }
+
+            SymLinkHelper.Initialize(fs.BasePath);
+
+            FileLogger.Info($"Hard Link support: {SymLinkHelper.AreHardLinksSupported}");
+            FileLogger.Info($"Symbolic Link support: {SymLinkHelper.AreSymLinksSupported}");
+
+            if (!ShouldUseHardLink() && !SymLinkHelper.AreSymLinksSupported)
+            {
+                return -2;
+            }
+
+            FileLogger.Info($"Is using hard links: {ShouldUseHardLink()}");
+
             string patchPath = "Patch";
             if (ProfilesLibrary.DataVersion == (int)ProfileVersion.Fifa17 || ProfilesLibrary.DataVersion == (int)ProfileVersion.DragonAgeInquisition || ProfilesLibrary.DataVersion == (int)ProfileVersion.Battlefield4 || ProfilesLibrary.DataVersion == (int)ProfileVersion.NeedForSpeed || ProfilesLibrary.DataVersion == (int)ProfileVersion.PlantsVsZombiesGardenWarfare2 || ProfilesLibrary.DataVersion == (int)ProfileVersion.NeedForSpeedRivals)
                 patchPath = "Update\\Patch\\Data";
-#if FROSTY_DEVELOPER
-            else if (ProfilesLibrary.DataVersion == (int)ProfileVersion.PlantsVsZombiesBattleforNeighborville)
+            else if (ProfilesLibrary.DataVersion == (int)ProfileVersion.PlantsVsZombiesBattleforNeighborville || ProfilesLibrary.DataVersion == (int)ProfileVersion.Battlefield5) //bfn and bfv dont have a patch directory
                 patchPath = "Data";
-#endif
 
             if (ProfilesLibrary.DataVersion == (int)ProfileVersion.Madden20)
             {
@@ -678,55 +1325,115 @@ namespace Frosty.ModSupport
             }
 
             // check for already running process
-            Process[] processes = Process.GetProcesses();
-            string processName = ProfilesLibrary.ProfileName;
-            foreach (Process process in processes)
+            try
             {
-                if (process.ProcessName.Equals(processName, StringComparison.OrdinalIgnoreCase))
+                Process[] processes = Process.GetProcesses();
+                string processName = ProfilesLibrary.ProfileName;
+                foreach (Process process in processes)
                 {
-                    FrostyMessageBox.Show(string.Format("Unable to launch process as there is already a running process with process Id {0}", process.Id), "Frosty Toolsuite");
-                    return -1;
+                    if (process.ProcessName.Equals(processName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        FrostyMessageBox.Show(string.Format("Unable to launch process as there is already a running process with process Id {0}", process.Id), "Frosty Toolsuite");
+                        return -1;
+                    }
                 }
             }
+            catch (Exception ex)
+            {
+                FileLogger.Info($"Encountered exception during process scanning. It doesn't affect mod installation. Details: {ex.Message}");
+            }
+
+            Stopwatch watch = new Stopwatch();
+            watch.Start();
 
             cancelToken.ThrowIfCancellationRequested();
-
-            cancelToken.ThrowIfCancellationRequested();
-            Logger.Log("Loading mods");
+            Logger.Log("Setup verification");
+            FileLogger.Info("Setup verification");
 
             bool needsModding = false;
-            if (!File.Exists(Path.Combine(modPath, patchPath, "mods.json")))
+            if (!File.Exists(Path.Combine(modDataPath, patchPath, "mods.json")))
+            {
                 needsModding = true;
+            }
+            else if (OperatingSystemHelper.IsWine() && !File.Exists(Path.Combine(fs.BasePath, "winmm.dll")))
+            {
+                FileLogger.Info($"Forcing mod install, due to missing '{Path.Combine(fs.BasePath, "winmm.dll")}'.");
+                needsModding = true;
+            }
             else
             {
-                List<ModInfo> oldModInfoList = JsonConvert.DeserializeObject<List<ModInfo>>(File.ReadAllText(Path.Combine(modPath, patchPath, "mods.json")));
-                List<ModInfo> currentModInfoList = GenerateModInfoList(modPaths, rootPath);
+                FileLogger.Info("Reading mods.json");
+
+                var modSetupJson = File.ReadAllText(Path.Combine(modDataPath, patchPath, "mods.json"));
+                var modSetup = new ModSetup();
+
+                try
+                {
+                    modSetup = JsonConvert.DeserializeObject<ModSetup>(modSetupJson);
+                }
+                catch
+                {
+                    FileLogger.Info("Damaged 'mods.json' file.");
+                    needsModding = true;
+                }
+
+                if (!needsModding && modSetup.IsHardlink != ShouldUseHardLink())
+                {
+                    FileLogger.Info($"Forcing mod install, due to not matching hard link usage.");
+                    needsModding = true;
+                }
+
+                var oldModInfoList = modSetup.ModInfos;
+                var currentModInfoList = GenerateModInfoList(modPaths, rootPath);
 
                 // check if the mod data needs recreating
                 // ie. mod change or patch
-                if (!IsSamePatch(modPath + patchPath) || !oldModInfoList.SequenceEqual(currentModInfoList))
+                if (!needsModding && !IsSamePatch(modDataPath + patchPath) || !oldModInfoList.SequenceEqual(currentModInfoList))
+                {
+                    FileLogger.Info($"Forcing mod install, due to outdated mod data folder.");
                     needsModding = true;
+                }
             }
+
+            FileLogger.Info($"Needs modding: {needsModding}");
 
             cancelToken.ThrowIfCancellationRequested();
             if (needsModding)
             {
-                cancelToken.ThrowIfCancellationRequested();
-                Logger.Log("Initializing resources");
+                bool newInstallation = false;
 
-                if (ProfilesLibrary.DataVersion == (int)ProfileVersion.StarWarsBattlefrontII)
+                if (!Directory.Exists(modDataPath))
                 {
+                    FileLogger.Info("Reseting ModData is not needed");
+                    newInstallation = true;
+                }
+                else if (ShouldCleanModDir(modDataPath))
+                {
+                    Logger.Log("Reseting ModData, it can take a few minutes");
+                    FileLogger.Info($"Reseting ModData at '{modDataPath}'.");
+                    SymLinkHelper.DeleteDirectorySafe(modDataPath);
+                    FileLogger.Info("Reseting ModData finished.");
+                }
+
+                cancelToken.ThrowIfCancellationRequested();
+                Logger.Log("Initializing Resources");
+
+                if (ProfilesLibrary.DataVersion == (int)ProfileVersion.StarWarsBattlefrontII || ProfilesLibrary.DataVersion == (int)ProfileVersion.Battlefield5)
+                {
+                    FileLogger.Info("Loading catalogs for SWBF2 or BF5");
                     foreach (string catalogName in fs.Catalogs)
                     {
-                        Dictionary<int, Dictionary<uint, CatResourceEntry>> entries = LoadCatalog(fs, "native_data/" + catalogName + "/cas.cat", out int hash);
+                        Dictionary<int, Dictionary<uint, CatResourceEntry>> entries = LoadCatalog("native_data/" + catalogName + "/cas.cat", out int hash);
                         if (entries != null)
                             resources.Add(hash, entries);
 
-                        entries = LoadCatalog(fs, "native_patch/" + catalogName + "/cas.cat", out hash);
+                        entries = LoadCatalog("native_patch/" + catalogName + "/cas.cat", out hash);
                         if (entries != null)
                             resources.Add(hash, entries);
                     }
                 }
+
+                FileLogger.Info("Loading cache");
 
                 rm = new ResourceManager(fs);
                 rm.SetLogger(logger);
@@ -741,798 +1448,155 @@ namespace Frosty.ModSupport
 
                 cancelToken.ThrowIfCancellationRequested();
                 Logger.Log("Loading mods");
+                App.Logger.Log("Loading mods");
+                FileLogger.Info("Loading mods");
 
+                // Get Full Modlist
+                List<FrostyMod> modList = new List<FrostyMod>();
                 foreach (string path in modPaths)
                 {
-                    FileInfo fi = new FileInfo(rootPath + path);
+                    FileInfo fi = new FileInfo(Path.Combine(rootPath, path));
 
-                    FrostyMod fmod = new FrostyMod(fi.FullName);
-                    if (fmod.NewFormat)
+                    if (fi.Extension == ".fbmod")
+                        modList.Add(new FrostyMod(fi.FullName));
+
+                    else if (fi.Extension == ".fbcollection")
                     {
-                        // process resources from mod
-                        ProcessModResources(fmod);
+                        foreach (FrostyMod mod in new FrostyModCollection(fi.FullName).Mods)
+                            modList.Add(mod);
+                    }
+                }
+
+                FileLogger.Info("Loading mod resources");
+
+                // Load Mod Resources
+                int currentMod = 0;
+                foreach (FrostyMod mod in modList)
+                {
+                    Logger.Log($"Loading Mods ({mod.ModDetails?.Title ?? mod.Filename.Replace(".fbmod", "")})");
+                    if (mod.NewFormat)
+                    {
+                        ProcessModResources(mod);
                     }
                     else
                     {
-                        FrostyModCollection fcollection = new FrostyModCollection(fi.FullName);
-                        if (fcollection.IsValid)
-                        {
-                            foreach (FrostyMod newMod in fcollection.Mods)
-                            {
-                                if (newMod.NewFormat)
-                                {
-                                    // process resources from mod
-                                    ProcessModResources(newMod);
-                                }
-                                else
-                                {
-                                    DbObject mod = null;
-                                    using (DbReader reader = new DbReader(new FileStream(newMod.Path, FileMode.Open, FileAccess.Read), null))
-                                        mod = reader.ReadDbObject();
-
-                                    string magic = mod.GetValue<string>("magic");
-                                    int ver = int.Parse(magic.Replace("FBMODV", ""));
-
-                                    // obtain bundles to modify
-                                    DbObject resourceList = mod.GetValue<DbObject>("resources");
-                                    foreach (DbObject action in mod.GetValue<DbObject>("actions"))
-                                    {
-                                        int bundle = Fnv1.HashString(action.GetValue<string>("bundle").ToLower());
-                                        string actionType = action.GetValue<string>("type");
-                                        int resourceId = action.GetValue<int>("resourceId");
-
-                                        if (!modifiedBundles.ContainsKey(bundle))
-                                            modifiedBundles.Add(bundle, new ModBundleInfo() { Name = bundle });
-
-                                        ModBundleInfo modBundle = modifiedBundles[bundle];
-                                        DbObject resource = resourceList[resourceId] as DbObject;
-
-                                        string resName = resource.GetValue<string>("name");
-                                        string resType = resource.GetValue<string>("type");
-
-                                        if (actionType == "modify")
-                                        {
-                                            switch (resType)
-                                            {
-                                                case "ebx": modBundle.Modify.Ebx.Add(resName); break;
-                                                case "res": modBundle.Modify.Res.Add(resName); break;
-                                                case "chunk": modBundle.Modify.Chunks.Add(new Guid(resName)); break;
-                                            }
-                                        }
-                                        else if (actionType == "add")
-                                        {
-                                            switch (resType)
-                                            {
-                                                case "ebx": modBundle.Add.Ebx.Add(resName); break;
-                                                case "res": modBundle.Add.Res.Add(resName); break;
-                                                case "chunk": modBundle.Add.Chunks.Add(new Guid(resName)); break;
-                                            }
-                                        }
-                                        else if (actionType == "remove")
-                                        {
-                                            switch (resType)
-                                            {
-                                                case "ebx": modBundle.Remove.Ebx.Add(resName); break;
-                                                case "res": modBundle.Remove.Res.Add(resName); break;
-                                                case "chunk": modBundle.Remove.Chunks.Add(new Guid(resName)); break;
-                                            }
-                                        }
-                                    }
-
-                                    // obtain resources to modify
-                                    foreach (DbObject resource in resourceList)
-                                    {
-                                        string resourceType = resource.GetValue<string>("type");
-                                        if (resourceType == "superbundle")
-                                        {
-                                            string name = resource.GetValue<string>("name");
-                                            addedSuperBundles.Add(name);
-                                        }
-                                        else if (resourceType == "bundle")
-                                        {
-                                            string name = resource.GetValue<string>("name");
-                                            string superBundle = resource.GetValue<string>("sb");
-
-                                            int hash = Fnv1a.HashString(superBundle.ToLower());
-                                            if (!addedBundles.ContainsKey(hash))
-                                                addedBundles.Add(hash, new List<string>());
-
-                                            addedBundles[hash].Add(name);
-                                        }
-                                        else if (resourceType == "ebx")
-                                        {
-                                            string name = resource.GetValue<string>("name");
-
-                                            if (modifiedEbx.ContainsKey(name))
-                                            {
-                                                EbxAssetEntry existingEntry = modifiedEbx[name];
-                                                if (existingEntry.Sha1 == resource.GetValue<Sha1>("sha1"))
-                                                    continue;
-
-                                                archiveData[existingEntry.Sha1].RefCount--;
-                                                if (archiveData[existingEntry.Sha1].RefCount == 0)
-                                                    archiveData.Remove(existingEntry.Sha1);
-
-                                                modifiedEbx.Remove(name);
-                                                numArchiveEntries--;
-                                            }
-
-                                            EbxAssetEntry entry = new EbxAssetEntry
-                                            {
-                                                Name = name,
-                                                OriginalSize = resource.GetValue<long>("uncompressedSize"),
-                                                Size = resource.GetValue<long>("compressedSize")
-                                            };
-
-                                            byte[] buffer = null;
-                                            if (resource.HasValue("archiveIndex"))
-                                            {
-                                                entry.IsInline = resource.GetValue<bool>("shouldInline");
-                                                buffer = GetResourceData(newMod.Path, resource.GetValue<int>("archiveIndex"), resource.GetValue<long>("archiveOffset"), (int)entry.Size);
-                                            }
-                                            else
-                                            {
-                                                ManifestFileRef fileRef = resource.GetValue<int>("file");
-                                                long offset = resource.GetValue<int>("offset");
-
-                                                using (NativeReader reader = new NativeReader(new FileStream(fs.ResolvePath(fileRef), FileMode.Open, FileAccess.Read)))
-                                                {
-                                                    reader.Position = offset;
-                                                    buffer = reader.ReadBytes((int)entry.Size);
-                                                }
-                                            }
-
-                                            entry.Sha1 = Utils.GenerateSha1(buffer);
-
-                                            modifiedEbx.Add(entry.Name, entry);
-                                            if (!archiveData.ContainsKey(entry.Sha1))
-                                                archiveData.Add(entry.Sha1, new ArchiveInfo() { Data = buffer, RefCount = 1 });
-                                            else
-                                                archiveData[entry.Sha1].RefCount++;
-                                            numArchiveEntries++;
-                                        }
-                                        else if (resourceType == "res")
-                                        {
-                                            string name = resource.GetValue<string>("name");
-
-                                            if (modifiedRes.ContainsKey(name))
-                                            {
-                                                ResAssetEntry existingEntry = modifiedRes[name];
-                                                if (existingEntry.Sha1 == resource.GetValue<Sha1>("sha1"))
-                                                    continue;
-
-                                                archiveData[existingEntry.Sha1].RefCount--;
-                                                if (archiveData[existingEntry.Sha1].RefCount == 0)
-                                                    archiveData.Remove(existingEntry.Sha1);
-
-                                                modifiedRes.Remove(name);
-                                                numArchiveEntries--;
-                                            }
-
-                                            ResAssetEntry entry = new ResAssetEntry
-                                            {
-                                                Name = name,
-                                                OriginalSize = resource.GetValue<long>("uncompressedSize"),
-                                                Size = resource.GetValue<long>("compressedSize"),
-                                                ResRid = (ulong)resource.GetValue<long>("resRid"),
-                                                ResType = (uint)resource.GetValue<int>("resType"),
-                                                ResMeta = resource.GetValue<byte[]>("resMeta")
-                                            };
-
-                                            byte[] buffer = null;
-                                            if (resource.HasValue("archiveIndex"))
-                                            {
-                                                entry.IsInline = resource.GetValue<bool>("shouldInline");
-                                                buffer = GetResourceData(newMod.Path, resource.GetValue<int>("archiveIndex"), resource.GetValue<long>("archiveOffset"), (int)entry.Size);
-                                            }
-                                            else
-                                            {
-                                                ManifestFileRef fileRef = resource.GetValue<int>("file");
-                                                long offset = resource.GetValue<int>("offset");
-
-                                                using (NativeReader reader = new NativeReader(new FileStream(fs.ResolvePath(fileRef), FileMode.Open, FileAccess.Read)))
-                                                {
-                                                    reader.Position = offset;
-                                                    buffer = reader.ReadBytes((int)entry.Size);
-                                                }
-                                            }
-
-                                            entry.Sha1 = Utils.GenerateSha1(buffer);
-
-                                            modifiedRes.Add(entry.Name, entry);
-                                            if (!archiveData.ContainsKey(entry.Sha1))
-                                                archiveData.Add(entry.Sha1, new ArchiveInfo() { Data = buffer, RefCount = 1 });
-                                            else
-                                                archiveData[entry.Sha1].RefCount++;
-                                            numArchiveEntries++;
-                                        }
-                                        else if (resourceType == "chunk")
-                                        {
-                                            Guid chunkId = new Guid(resource.GetValue<string>("name"));
-
-                                            //if (resource.HasValue("handler"))
-                                            //{
-                                            //    ChunkAssetEntry entry = null;
-                                            //    HandlerExtraData extraData = null;
-                                            //    byte[] buffer = GetResourceData(fi.FullName, resource.GetValue<int>("archiveIndex"), resource.GetValue<long>("archiveOffset"), resource.GetValue<int>("compressedSize"));
-
-                                            //    if (modifiedChunks.ContainsKey(chunkId))
-                                            //    {
-                                            //        entry = modifiedChunks[chunkId];
-                                            //        extraData = (HandlerExtraData)entry.ExtraData;
-                                            //    }
-                                            //    else
-                                            //    {
-                                            //        entry = new ChunkAssetEntry();
-                                            //        extraData = new HandlerExtraData();
-
-                                            //        entry.Id = chunkId;
-                                            //        entry.IsTocChunk = resource.GetValue<bool>("tocChunk");
-                                            //        // the rest of the chunk will be populated via the handler
-
-                                            //        Type handlerType = Type.GetType("Frosty.ModSupport.Handlers." + resource.GetValue<string>("handler"));
-                                            //        extraData.Handler = (ICustomActionHandler)Activator.CreateInstance(handlerType);
-
-                                            //        entry.ExtraData = extraData;
-                                            //        modifiedChunks.Add(chunkId, entry);
-                                            //    }
-
-                                            //    // merge new and old data together
-                                            //    extraData.Data = extraData.Handler.Load(extraData.Data, buffer);
-                                            //}
-                                            //else
-                                            //{
-                                            if (modifiedChunks.ContainsKey(chunkId))
-                                            {
-                                                ChunkAssetEntry existingEntry = modifiedChunks[chunkId];
-                                                if (existingEntry.Sha1 == resource.GetValue<Sha1>("sha1"))
-                                                    continue;
-
-                                                archiveData[existingEntry.Sha1].RefCount--;
-                                                if (archiveData[existingEntry.Sha1].RefCount == 0)
-                                                    archiveData.Remove(existingEntry.Sha1);
-
-                                                modifiedChunks.Remove(chunkId);
-                                                numArchiveEntries--;
-                                            }
-
-                                            ChunkAssetEntry entry = new ChunkAssetEntry
-                                            {
-                                                Id = chunkId,
-                                                Size = resource.GetValue<long>("compressedSize"),
-                                                LogicalOffset = resource.GetValue<uint>("logicalOffset"),
-                                                LogicalSize = resource.GetValue<uint>("logicalSize"),
-                                                RangeStart = resource.GetValue<uint>("rangeStart"),
-                                                RangeEnd = resource.GetValue<uint>("rangeEnd"),
-                                                FirstMip = resource.GetValue<int>("firstMip", -1),
-                                                H32 = resource.GetValue<int>("h32", 0),
-                                                IsTocChunk = resource.GetValue<bool>("tocChunk")
-                                            };
-
-                                            byte[] buffer = null;
-                                            if (resource.HasValue("archiveIndex"))
-                                            {
-                                                // obtain data from archive
-                                                entry.IsInline = resource.GetValue<bool>("shouldInline", false);
-                                                buffer = GetResourceData(newMod.Path, resource.GetValue<int>("archiveIndex"), resource.GetValue<long>("archiveOffset"), (int)entry.Size);
-                                            }
-                                            else
-                                            {
-                                                ManifestFileRef fileRef = resource.GetValue<int>("file");
-                                                long offset = resource.GetValue<int>("offset");
-
-                                                // obtain data from cas file location
-                                                using (NativeReader reader = new NativeReader(new FileStream(fs.ResolvePath(fileRef), FileMode.Open, FileAccess.Read)))
-                                                {
-                                                    reader.Position = offset;
-                                                    buffer = reader.ReadBytes((int)entry.Size);
-                                                }
-
-                                                if (ProfilesLibrary.DataVersion == (int)ProfileVersion.StarWarsBattlefrontII || ProfilesLibrary.DataVersion == (int)ProfileVersion.Battlefield5)
-                                                {
-                                                    if (entry.LogicalOffset != 0)
-                                                    {
-                                                        // calculate range values from cas data
-                                                        using (NativeReader reader = new NativeReader(new MemoryStream(buffer)))
-                                                        {
-                                                            int totalSize = 0;
-                                                            while (totalSize != entry.LogicalOffset)
-                                                            {
-                                                                int uncompressedSize = reader.ReadInt(Endian.Big);
-                                                                ushort compressCode = reader.ReadUShort(Endian.Big);
-                                                                ushort blockSize = reader.ReadUShort(Endian.Big);
-
-                                                                totalSize += uncompressedSize;
-                                                                if (totalSize > entry.LogicalOffset)
-                                                                {
-                                                                    reader.Position -= 8;
-                                                                    break;
-                                                                }
-
-                                                                reader.Position += blockSize;
-                                                            }
-
-                                                            entry.RangeStart = (uint)reader.Position;
-                                                            entry.RangeEnd = (uint)buffer.Length;
-                                                        }
-                                                    }
-                                                }
-                                            }
-
-                                            entry.Sha1 = Utils.GenerateSha1(buffer);
-
-                                            modifiedChunks.Add(entry.Id, entry);
-                                            if (!archiveData.ContainsKey(entry.Sha1))
-                                                archiveData.Add(entry.Sha1, new ArchiveInfo() { Data = buffer, RefCount = 1 });
-                                            else
-                                                archiveData[entry.Sha1].RefCount++;
-                                            numArchiveEntries++;
-
-                                            if (ver < 2)
-                                            {
-                                                // previous mod format versions had no action listed for toc chunk changes
-                                                // so now have to manually add an action for it.
-                                                if (!modifiedBundles.ContainsKey(chunksBundleHash))
-                                                    modifiedBundles.Add(chunksBundleHash, new ModBundleInfo() { Name = chunksBundleHash });
-                                                ModBundleInfo chunksBundle = modifiedBundles[chunksBundleHash];
-                                                chunksBundle.Modify.Chunks.Add(entry.Id);
-
-                                                // new code requires first mip to be set to modify range values, however
-                                                // old mods didnt modify this. So lets force it, hopefully not too many
-                                                // issues result from this.
-                                                entry.FirstMip = 0;
-                                            }
-
-                                            if (entry.FirstMip == -1 && entry.RangeEnd != 0)
-                                                entry.FirstMip = 0;
-                                            //}
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        else
-                        {
-                            DbObject mod = null;
-                            using (DbReader reader = new DbReader(new FileStream(fi.FullName, FileMode.Open, FileAccess.Read), null))
-                                mod = reader.ReadDbObject();
-
-                            string magic = mod.GetValue<string>("magic");
-                            int ver = int.Parse(magic.Replace("FBMODV", ""));
-
-                            // obtain bundles to modify
-                            DbObject resourceList = mod.GetValue<DbObject>("resources");
-                            foreach (DbObject action in mod.GetValue<DbObject>("actions"))
-                            {
-                                int bundle = Fnv1.HashString(action.GetValue<string>("bundle").ToLower());
-                                string actionType = action.GetValue<string>("type");
-                                int resourceId = action.GetValue<int>("resourceId");
-
-                                if (!modifiedBundles.ContainsKey(bundle))
-                                    modifiedBundles.Add(bundle, new ModBundleInfo() { Name = bundle });
-
-                                ModBundleInfo modBundle = modifiedBundles[bundle];
-                                DbObject resource = resourceList[resourceId] as DbObject;
-
-                                string resName = resource.GetValue<string>("name");
-                                string resType = resource.GetValue<string>("type");
-
-                                if (actionType == "modify")
-                                {
-                                    switch (resType)
-                                    {
-                                        case "ebx": modBundle.Modify.Ebx.Add(resName); break;
-                                        case "res": modBundle.Modify.Res.Add(resName); break;
-                                        case "chunk": modBundle.Modify.Chunks.Add(new Guid(resName)); break;
-                                    }
-                                }
-                                else if (actionType == "add")
-                                {
-                                    switch (resType)
-                                    {
-                                        case "ebx": modBundle.Add.Ebx.Add(resName); break;
-                                        case "res": modBundle.Add.Res.Add(resName); break;
-                                        case "chunk": modBundle.Add.Chunks.Add(new Guid(resName)); break;
-                                    }
-                                }
-                                else if (actionType == "remove")
-                                {
-                                    switch (resType)
-                                    {
-                                        case "ebx": modBundle.Remove.Ebx.Add(resName); break;
-                                        case "res": modBundle.Remove.Res.Add(resName); break;
-                                        case "chunk": modBundle.Remove.Chunks.Add(new Guid(resName)); break;
-                                    }
-                                }
-                            }
-
-                            // obtain resources to modify
-                            foreach (DbObject resource in resourceList)
-                            {
-                                string resourceType = resource.GetValue<string>("type");
-                                if (resourceType == "superbundle")
-                                {
-                                    string name = resource.GetValue<string>("name");
-                                    addedSuperBundles.Add(name);
-                                }
-                                else if (resourceType == "bundle")
-                                {
-                                    string name = resource.GetValue<string>("name");
-                                    string superBundle = resource.GetValue<string>("sb");
-
-                                    int hash = Fnv1a.HashString(superBundle.ToLower());
-                                    if (!addedBundles.ContainsKey(hash))
-                                        addedBundles.Add(hash, new List<string>());
-
-                                    addedBundles[hash].Add(name);
-                                }
-                                else if (resourceType == "ebx")
-                                {
-                                    string name = resource.GetValue<string>("name");
-
-                                    if (modifiedEbx.ContainsKey(name))
-                                    {
-                                        EbxAssetEntry existingEntry = modifiedEbx[name];
-                                        if (existingEntry.Sha1 == resource.GetValue<Sha1>("sha1"))
-                                            continue;
-
-                                        archiveData[existingEntry.Sha1].RefCount--;
-                                        if (archiveData[existingEntry.Sha1].RefCount == 0)
-                                            archiveData.Remove(existingEntry.Sha1);
-
-                                        modifiedEbx.Remove(name);
-                                        numArchiveEntries--;
-                                    }
-
-                                    EbxAssetEntry entry = new EbxAssetEntry
-                                    {
-                                        Name = name,
-                                        OriginalSize = resource.GetValue<long>("uncompressedSize"),
-                                        Size = resource.GetValue<long>("compressedSize")
-                                    };
-
-                                    byte[] buffer = null;
-                                    if (resource.HasValue("archiveIndex"))
-                                    {
-                                        entry.IsInline = resource.GetValue<bool>("shouldInline");
-                                        buffer = GetResourceData(fi.FullName, resource.GetValue<int>("archiveIndex"), resource.GetValue<long>("archiveOffset"), (int)entry.Size);
-                                    }
-                                    else
-                                    {
-                                        ManifestFileRef fileRef = resource.GetValue<int>("file");
-                                        long offset = resource.GetValue<int>("offset");
-
-                                        using (NativeReader reader = new NativeReader(new FileStream(fs.ResolvePath(fileRef), FileMode.Open, FileAccess.Read)))
-                                        {
-                                            reader.Position = offset;
-                                            buffer = reader.ReadBytes((int)entry.Size);
-                                        }
-                                    }
-
-                                    entry.Sha1 = Utils.GenerateSha1(buffer);
-
-                                    modifiedEbx.Add(entry.Name, entry);
-                                    if (!archiveData.ContainsKey(entry.Sha1))
-                                        archiveData.Add(entry.Sha1, new ArchiveInfo() { Data = buffer, RefCount = 1 });
-                                    else
-                                        archiveData[entry.Sha1].RefCount++;
-                                    numArchiveEntries++;
-                                }
-                                else if (resourceType == "res")
-                                {
-                                    string name = resource.GetValue<string>("name");
-
-                                    if (modifiedRes.ContainsKey(name))
-                                    {
-                                        ResAssetEntry existingEntry = modifiedRes[name];
-                                        if (existingEntry.Sha1 == resource.GetValue<Sha1>("sha1"))
-                                            continue;
-
-                                        archiveData[existingEntry.Sha1].RefCount--;
-                                        if (archiveData[existingEntry.Sha1].RefCount == 0)
-                                            archiveData.Remove(existingEntry.Sha1);
-
-                                        modifiedRes.Remove(name);
-                                        numArchiveEntries--;
-                                    }
-
-                                    ResAssetEntry entry = new ResAssetEntry
-                                    {
-                                        Name = name,
-                                        OriginalSize = resource.GetValue<long>("uncompressedSize"),
-                                        Size = resource.GetValue<long>("compressedSize"),
-                                        ResRid = (ulong)resource.GetValue<long>("resRid"),
-                                        ResType = (uint)resource.GetValue<int>("resType"),
-                                        ResMeta = resource.GetValue<byte[]>("resMeta")
-                                    };
-
-                                    byte[] buffer = null;
-                                    if (resource.HasValue("archiveIndex"))
-                                    {
-                                        entry.IsInline = resource.GetValue<bool>("shouldInline");
-                                        buffer = GetResourceData(fi.FullName, resource.GetValue<int>("archiveIndex"), resource.GetValue<long>("archiveOffset"), (int)entry.Size);
-                                    }
-                                    else
-                                    {
-                                        ManifestFileRef fileRef = resource.GetValue<int>("file");
-                                        long offset = resource.GetValue<int>("offset");
-
-                                        using (NativeReader reader = new NativeReader(new FileStream(fs.ResolvePath(fileRef), FileMode.Open, FileAccess.Read)))
-                                        {
-                                            reader.Position = offset;
-                                            buffer = reader.ReadBytes((int)entry.Size);
-                                        }
-                                    }
-
-                                    entry.Sha1 = Utils.GenerateSha1(buffer);
-
-                                    modifiedRes.Add(entry.Name, entry);
-                                    if (!archiveData.ContainsKey(entry.Sha1))
-                                        archiveData.Add(entry.Sha1, new ArchiveInfo() { Data = buffer, RefCount = 1 });
-                                    else
-                                        archiveData[entry.Sha1].RefCount++;
-                                    numArchiveEntries++;
-                                }
-                                else if (resourceType == "chunk")
-                                {
-                                    Guid chunkId = new Guid(resource.GetValue<string>("name"));
-
-                                    //if (resource.HasValue("handler"))
-                                    //{
-                                    //    ChunkAssetEntry entry = null;
-                                    //    HandlerExtraData extraData = null;
-                                    //    byte[] buffer = GetResourceData(fi.FullName, resource.GetValue<int>("archiveIndex"), resource.GetValue<long>("archiveOffset"), resource.GetValue<int>("compressedSize"));
-
-                                    //    if (modifiedChunks.ContainsKey(chunkId))
-                                    //    {
-                                    //        entry = modifiedChunks[chunkId];
-                                    //        extraData = (HandlerExtraData)entry.ExtraData;
-                                    //    }
-                                    //    else
-                                    //    {
-                                    //        entry = new ChunkAssetEntry();
-                                    //        extraData = new HandlerExtraData();
-
-                                    //        entry.Id = chunkId;
-                                    //        entry.IsTocChunk = resource.GetValue<bool>("tocChunk");
-                                    //        // the rest of the chunk will be populated via the handler
-
-                                    //        Type handlerType = Type.GetType("Frosty.ModSupport.Handlers." + resource.GetValue<string>("handler"));
-                                    //        extraData.Handler = (ICustomActionHandler)Activator.CreateInstance(handlerType);
-
-                                    //        entry.ExtraData = extraData;
-                                    //        modifiedChunks.Add(chunkId, entry);
-                                    //    }
-
-                                    //    // merge new and old data together
-                                    //    extraData.Data = extraData.Handler.Load(extraData.Data, buffer);
-                                    //}
-                                    //else
-                                    //{
-                                    if (modifiedChunks.ContainsKey(chunkId))
-                                    {
-                                        ChunkAssetEntry existingEntry = modifiedChunks[chunkId];
-                                        if (existingEntry.Sha1 == resource.GetValue<Sha1>("sha1"))
-                                            continue;
-
-                                        archiveData[existingEntry.Sha1].RefCount--;
-                                        if (archiveData[existingEntry.Sha1].RefCount == 0)
-                                            archiveData.Remove(existingEntry.Sha1);
-
-                                        modifiedChunks.Remove(chunkId);
-                                        numArchiveEntries--;
-                                    }
-
-                                    ChunkAssetEntry entry = new ChunkAssetEntry
-                                    {
-                                        Id = chunkId,
-                                        Size = resource.GetValue<long>("compressedSize"),
-                                        LogicalOffset = resource.GetValue<uint>("logicalOffset"),
-                                        LogicalSize = resource.GetValue<uint>("logicalSize"),
-                                        RangeStart = resource.GetValue<uint>("rangeStart"),
-                                        RangeEnd = resource.GetValue<uint>("rangeEnd"),
-                                        FirstMip = resource.GetValue<int>("firstMip", -1),
-                                        H32 = resource.GetValue<int>("h32", 0),
-                                        IsTocChunk = resource.GetValue<bool>("tocChunk")
-                                    };
-
-                                    byte[] buffer = null;
-                                    if (resource.HasValue("archiveIndex"))
-                                    {
-                                        // obtain data from archive
-                                        entry.IsInline = resource.GetValue<bool>("shouldInline", false);
-                                        buffer = GetResourceData(fi.FullName, resource.GetValue<int>("archiveIndex"), resource.GetValue<long>("archiveOffset"), (int)entry.Size);
-                                    }
-                                    else
-                                    {
-                                        ManifestFileRef fileRef = resource.GetValue<int>("file");
-                                        long offset = resource.GetValue<int>("offset");
-
-                                        // obtain data from cas file location
-                                        using (NativeReader reader = new NativeReader(new FileStream(fs.ResolvePath(fileRef), FileMode.Open, FileAccess.Read)))
-                                        {
-                                            reader.Position = offset;
-                                            buffer = reader.ReadBytes((int)entry.Size);
-                                        }
-
-                                        if (ProfilesLibrary.DataVersion == (int)ProfileVersion.StarWarsBattlefrontII || ProfilesLibrary.DataVersion == (int)ProfileVersion.Battlefield5)
-                                        {
-                                            if (entry.LogicalOffset != 0)
-                                            {
-                                                // calculate range values from cas data
-                                                using (NativeReader reader = new NativeReader(new MemoryStream(buffer)))
-                                                {
-                                                    int totalSize = 0;
-                                                    while (totalSize != entry.LogicalOffset)
-                                                    {
-                                                        int uncompressedSize = reader.ReadInt(Endian.Big);
-                                                        ushort compressCode = reader.ReadUShort(Endian.Big);
-                                                        ushort blockSize = reader.ReadUShort(Endian.Big);
-
-                                                        totalSize += uncompressedSize;
-                                                        if (totalSize > entry.LogicalOffset)
-                                                        {
-                                                            reader.Position -= 8;
-                                                            break;
-                                                        }
-
-                                                        reader.Position += blockSize;
-                                                    }
-
-                                                    entry.RangeStart = (uint)reader.Position;
-                                                    entry.RangeEnd = (uint)buffer.Length;
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    entry.Sha1 = Utils.GenerateSha1(buffer);
-
-                                    modifiedChunks.Add(entry.Id, entry);
-                                    if (!archiveData.ContainsKey(entry.Sha1))
-                                        archiveData.Add(entry.Sha1, new ArchiveInfo() { Data = buffer, RefCount = 1 });
-                                    else
-                                        archiveData[entry.Sha1].RefCount++;
-                                    numArchiveEntries++;
-
-                                    if (ver < 2)
-                                    {
-                                        // previous mod format versions had no action listed for toc chunk changes
-                                        // so now have to manually add an action for it.
-                                        if (!modifiedBundles.ContainsKey(chunksBundleHash))
-                                            modifiedBundles.Add(chunksBundleHash, new ModBundleInfo() { Name = chunksBundleHash });
-                                        ModBundleInfo chunksBundle = modifiedBundles[chunksBundleHash];
-                                        chunksBundle.Modify.Chunks.Add(entry.Id);
-
-                                        // new code requires first mip to be set to modify range values, however
-                                        // old mods didnt modify this. So lets force it, hopefully not too many
-                                        // issues result from this.
-                                        entry.FirstMip = 0;
-                                    }
-
-                                    if (entry.FirstMip == -1 && entry.RangeEnd != 0)
-                                        entry.FirstMip = 0;
-                                    //}
-                                }
-                            }
-                        }
+                        ProcessLegacyModResources(mod.Path);
                     }
+                    ReportProgress(currentMod++, modList.Count);
                 }
 
                 Logger.Log("Applying handlers");
+                App.Logger.Log("Applying handlers");
+                FileLogger.Info("Applying handlers");
 
                 // apply handlers
-                int totalResources = modifiedEbx.Count + modifiedRes.Count + modifiedChunks.Count;
-                int currentResource = 0;
-
                 RuntimeResources runtimeResources = new RuntimeResources();
-                foreach (var entry in modifiedEbx.Values)
-                {
-                    Logger.Log($"Applying handlers ({entry.Filename})");
 
+                List<AssetEntry> assetEntries = new List<AssetEntry>();
+                assetEntries.AddRange(modifiedEbx.Values);
+                assetEntries.AddRange(modifiedRes.Values);
+                assetEntries.AddRange(modifiedChunks.Values);
+
+                int currentResource = 0;
+                Parallel.ForEach(assetEntries, new ParallelOptions() { MaxDegreeOfParallelism = Environment.ProcessorCount }, entry =>
+                {
                     if (entry.ExtraData is HandlerExtraData handlerExtaData)
                     {
                         handlerExtaData.Handler.Modify(entry, am, runtimeResources, handlerExtaData.Data, out byte[] data);
 
-                        if (!archiveData.ContainsKey(entry.Sha1))
-                            archiveData.Add(entry.Sha1, new ArchiveInfo() { Data = data, RefCount = 1 });
-                        else
+                        if (!archiveData.TryAdd(entry.Sha1, new ArchiveInfo() { Data = data, RefCount = 1 }))
                             archiveData[entry.Sha1].RefCount++;
                     }
-
-                    currentResource++;
-                    uint progress = (uint)((currentResource / (float)totalResources) * 100);
-                    logger.Log("progress:" + progress);
-                }
-                foreach (var entry in modifiedRes.Values)
-                {
-                    Logger.Log($"Applying handlers ({entry.Filename})");
-
-                    if (entry.ExtraData is HandlerExtraData handlerExtaData)
-                    {
-                        handlerExtaData.Handler.Modify(entry, am, runtimeResources, handlerExtaData.Data, out byte[] data);
-
-                        if (!archiveData.ContainsKey(entry.Sha1))
-                            archiveData.Add(entry.Sha1, new ArchiveInfo() { Data = data, RefCount = 1 });
-                        else
-                            archiveData[entry.Sha1].RefCount++;
-                    }
-
-                    currentResource++;
-                    uint progress = (uint)((currentResource / (float)totalResources) * 100);
-                    logger.Log("progress:" + progress);
-                }
-                foreach (var entry in modifiedChunks.Values)
-                {
-                    Logger.Log($"Applying handlers ({entry.Filename})");
-
-                    if (entry.ExtraData is HandlerExtraData handlerExtaData)
-                    {
-                        handlerExtaData.Handler.Modify(entry, am, runtimeResources, handlerExtaData.Data, out byte[] data);
-
-                        if (!archiveData.ContainsKey(entry.Sha1))
-                            archiveData.Add(entry.Sha1, new ArchiveInfo() { Data = data, RefCount = 1 });
-                        else
-                            archiveData[entry.Sha1].RefCount++;
-                    }
-
-                    currentResource++;
-                    uint progress = (uint)((currentResource / (float)totalResources) * 100);
-                    logger.Log("progress:" + progress);
-                }
+                    ReportProgress(currentResource++, assetEntries.Count);
+                });
 
                 // process any new resources added during custom handler modification
                 ProcessModResources(runtimeResources);
 
                 cancelToken.ThrowIfCancellationRequested();
-                Logger.Log("Cleaning up mod data directory");
+                Logger.Log("Cleaning up ModData, it can take a few minutes");
+                App.Logger.Log("Cleaning up ModData");
+                FileLogger.Info("Cleaning up ModData.");
 
                 List<SymLinkStruct> cmdArgs = new List<SymLinkStruct>();
-                bool newInstallation = false;
 
                 fs.ResetManifest();
-                if (!DeleteSelectFiles(modPath + patchPath))
+                if (!DeleteSelectFiles(modDataPath + patchPath))
                 {
-                    if (!Directory.Exists(modPath))
+                    if (!Directory.Exists(modDataPath))
                     {
-                        newInstallation = true;
-                        Logger.Log("Creating mod data directory");
+                        Logger.Log("Creating ModData");
+                        FileLogger.Info("Creating ModData");
 
                         // create mod path
-                        Directory.CreateDirectory(modPath);
+                        Directory.CreateDirectory(modDataPath);
 
-                        if (ProfilesLibrary.DataVersion == (int)ProfileVersion.StarWarsBattlefrontII || ProfilesLibrary.DataVersion == (int)ProfileVersion.Battlefield5)
+                        if (ProfilesLibrary.DataVersion == (int)ProfileVersion.StarWarsBattlefrontII)
                         {
-                            if (!Directory.Exists(modPath + "Data"))
-                                Directory.CreateDirectory(modPath + "Data");
-                            cmdArgs.Add(new SymLinkStruct(modPath + "Data/Win32", fs.BasePath + "Data/Win32", true));
+                            var modDataPathBf2Extra = modDataPath + "Data";
+
+                            FileLogger.Info($"Validating SWBF2 mod data path '{modDataPathBf2Extra}'");
+
+                            if (!Directory.Exists(modDataPathBf2Extra))
+                            {
+                                FileLogger.Info($"Creating SWBF2 mod data path '{modDataPathBf2Extra}'");
+                                Directory.CreateDirectory(modDataPathBf2Extra);
+                            }
+
+                            var modDataPathBf2Win = modDataPath + "Data/Win32";
+                            var fsBasePathBf2Win = fs.BasePath + "Data/Win32";
+
+                            FileLogger.Info($"Adding SWBF2 win mod data path '{modDataPathBf2Win}' and win fs base path '{fsBasePathBf2Win}'");
+
+                            cmdArgs.Add(new SymLinkStruct(modDataPathBf2Win, fsBasePathBf2Win, true));
+                        }
+                        else if (ProfilesLibrary.DataVersion == (int)ProfileVersion.Battlefield5) //bfv doesnt have a patch directory so we need to rebuild the data folder structure instead
+                        {
+                            if (!Directory.Exists(modDataPath + "Data"))
+                                Directory.CreateDirectory(modDataPath + "Data");
+
+                            foreach (string casFilename in Directory.EnumerateFiles(fs.BasePath + patchPath, "*.cas", SearchOption.AllDirectories))
+                            {
+                                FileInfo casFi = new FileInfo(casFilename);
+                                string destPath = casFi.Directory.FullName.ToLower().Replace("\\" + patchPath.ToLower(), "\\" + modDirName.ToLower() + "\\" + patchPath.ToLower());
+                                string tempPath = Path.Combine(destPath, casFi.Name);
+
+                                if (!Directory.Exists(destPath))
+                                    Directory.CreateDirectory(destPath);
+
+                                cmdArgs.Add(new SymLinkStruct(tempPath, casFi.FullName, false));
+                            }
                         }
                         else
                         {
                             // data path
-                            cmdArgs.Add(new SymLinkStruct(modPath + "Data", fs.BasePath + "Data", true));
+                            cmdArgs.Add(new SymLinkStruct(modDataPath + "Data", fs.BasePath + "Data", true));
                         }
 
                         if (ProfilesLibrary.DataVersion == (int)ProfileVersion.DragonAgeInquisition || ProfilesLibrary.DataVersion == (int)ProfileVersion.Battlefield4 || ProfilesLibrary.DataVersion == (int)ProfileVersion.NeedForSpeed || ProfilesLibrary.DataVersion == (int)ProfileVersion.PlantsVsZombiesGardenWarfare2 || ProfilesLibrary.DataVersion == (int)ProfileVersion.NeedForSpeedRivals)
                         {
                             // create update dir if it does not exist
-                            if (!Directory.Exists(modPath + "Update"))
-                                Directory.CreateDirectory(modPath + "Update");
+                            if (!Directory.Exists(modDataPath + "Update"))
+                                Directory.CreateDirectory(modDataPath + "Update");
+
+                            var dirs = Directory.GetDirectories(Path.Combine(fs.BasePath, "Update"));
 
                             // update paths
-                            foreach (string path in Directory.EnumerateDirectories(fs.BasePath + "Update"))
+                            foreach (string path in dirs)
                             {
                                 DirectoryInfo di = new DirectoryInfo(path);
 
                                 // ignore the patch directory
                                 if (di.Name.ToLower() != "patch")
-                                    cmdArgs.Add(new SymLinkStruct(modPath + "Update/" + di.Name, di.FullName, true));
+                                {
+                                    cmdArgs.Add(new SymLinkStruct(modDataPath + "Update/" + di.Name, di.FullName, true));
+                                }
                             }
                         }
                         else if (ProfilesLibrary.DataVersion != (int)ProfileVersion.Fifa17)
                         {
                             // update path
-                            cmdArgs.Add(new SymLinkStruct(modPath + "Update", fs.BasePath + "Update", true));
+                            cmdArgs.Add(new SymLinkStruct(modDataPath + "Update", fs.BasePath + "Update", true));
                         }
 
                         if (ProfilesLibrary.DataVersion == (int)ProfileVersion.Fifa19 || ProfilesLibrary.DataVersion == (int)ProfileVersion.Madden20 || ProfilesLibrary.DataVersion == (int)ProfileVersion.Fifa20 || ProfilesLibrary.DataVersion == (int)ProfileVersion.NeedForSpeedHeat
@@ -1556,10 +1620,16 @@ namespace Frosty.ModSupport
                     }
                 }
 
+                FileLogger.Info("Cleaning up ModData finished.");
+
                 // add cas files to link
                 foreach (string catalog in fs.Catalogs)
                 {
                     string path = fs.ResolvePath("native_patch/" + catalog + "/cas.cat");
+                    if (ProfilesLibrary.DataVersion == (int)ProfileVersion.Battlefield5) //again, no patch directory. fun.
+                    {
+                        path = fs.ResolvePath("native_data/" + catalog + "/cas.cat");
+                    }
                     if (!File.Exists(path))
                         continue;
 
@@ -1589,13 +1659,28 @@ namespace Frosty.ModSupport
                     if (newInstallation)
                         reason = "New installation detected.";
 
-                    FrostyMessageBox.Show(reason + "\r\n\r\nShortly you will be prompted for elevated privileges, this is required to create symbolic links between the original data and the new modified data. Please ensure that you accept this to avoid any issues.", "Frosty Toolsuite");
+                    Logger.Log("Creating links");
+                    App.Logger.Log("Creating links");
+                    FileLogger.Info("Creating links");
+
+                    if (!OperatingSystemHelper.IsWine() && !ShouldUseHardLink())
+                    {
+                        FrostyMessageBox.Show(reason + "\r\n\r\nShortly you will be prompted for elevated privileges, this is required to create symbolic links between the original data and the new modified data. Please ensure that you accept this to avoid any issues.", "Frosty Toolsuite");
+                    }
+
                     if (!RunSymbolicLinkProcess(cmdArgs))
                     {
-                        Directory.Delete(modPath, true);
-                        throw new FrostySymLinkException();
+                        FrostyMessageBox.Show("Frosty needs to generate symbolic links, please ensure that you accept this so you don't have to regenerate ModData.", "Frosty Editor");
+                        if (!RunSymbolicLinkProcess(cmdArgs))
+                        {
+                            SymLinkHelper.DeleteDirectorySafe(modDataPath);
+                            FrostyMessageBox.Show("One ore more symbolic links could not be created, please restart tool as Administrator and ensure your storage drive is formatted to NTFS (not exFAT).", "Frosty Editor");
+                            return -1;
+                        }
                     }
                 }
+
+                FileLogger.Info("Update threadpool");
 
                 // set max threads to processor amount (stop hitching)
                 ThreadPool.GetMaxThreads(out int workerThreads, out int completionPortThreads);
@@ -1604,6 +1689,8 @@ namespace Frosty.ModSupport
                 // modify tocs and sbs
                 cancelToken.ThrowIfCancellationRequested();
                 Logger.Log("Applying mods");
+                App.Logger.Log("Applying mods");
+                FileLogger.Info("Applying mods");
 
                 cmdArgs.Clear();
 
@@ -1650,7 +1737,7 @@ namespace Frosty.ModSupport
                     {
                         // show progress
                         cancelToken.ThrowIfCancellationRequested();
-                        logger.Log("progress:" + ((totalTasks - numTasks) / (double)totalTasks) * 100.0d);
+                        ReportProgress(totalTasks - numTasks, totalTasks);
                         Thread.Sleep(1);
                     }
 
@@ -1666,7 +1753,7 @@ namespace Frosty.ModSupport
                         if (!completedAction.TocModified)
                         {
                             string srcPath = fs.ResolvePath(completedAction.SuperBundle + ".toc");
-                            FileInfo sbFi = new FileInfo(modPath + patchPath + "/" + completedAction.SuperBundle + ".toc");
+                            FileInfo sbFi = new FileInfo(modDataPath + patchPath + "/" + completedAction.SuperBundle + ".toc");
 
                             if (!Directory.Exists(sbFi.DirectoryName))
                                 Directory.CreateDirectory(sbFi.DirectoryName);
@@ -1676,7 +1763,7 @@ namespace Frosty.ModSupport
                         if (!completedAction.SbModified)
                         {
                             string srcPath = fs.ResolvePath(completedAction.SuperBundle + ".sb");
-                            FileInfo sbFi = new FileInfo(modPath + patchPath + "/" + completedAction.SuperBundle + ".sb");
+                            FileInfo sbFi = new FileInfo(modDataPath + patchPath + "/" + completedAction.SuperBundle + ".sb");
 
                             if (!Directory.Exists(sbFi.DirectoryName))
                                 Directory.CreateDirectory(sbFi.DirectoryName);
@@ -1711,7 +1798,7 @@ namespace Frosty.ModSupport
                     {
                         // show progress
                         cancelToken.ThrowIfCancellationRequested();
-                        logger.Log("progress:" + ((totalTasks - numTasks) / (double)totalTasks) * 100.0d);
+                        ReportProgress(totalTasks - numTasks, totalTasks);
                         Thread.Sleep(1);
                     }
 
@@ -1745,13 +1832,14 @@ namespace Frosty.ModSupport
                     }
 
                     // write out layout.toc with additional cas entries where required
-                    using (DbWriter writer = new DbWriter(new FileStream(modPath + patchPath + "/layout.toc", FileMode.Create), true))
+                    using (DbWriter writer = new DbWriter(new FileStream(modDataPath + patchPath + "/layout.toc", FileMode.Create), true))
                         writer.Write(layout);
                 }
                 else if (ProfilesLibrary.DataVersion == (int)ProfileVersion.StarWarsBattlefrontII || ProfilesLibrary.DataVersion == (int)ProfileVersion.Battlefield5)
                 {
-                    List<ManifestBundleAction> actions = new List<ManifestBundleAction>();
-                    ManualResetEvent doneEvent = new ManualResetEvent(false);
+                    FileLogger.Info("Adding manifests for SWBF2 bundles");
+
+                    ConcurrentBag<ManifestBundleAction> actions = new ConcurrentBag<ManifestBundleAction>();
 
                     if (addedBundles.Count != 0)
                     {
@@ -1767,7 +1855,15 @@ namespace Frosty.ModSupport
                             continue;
 
                         ManifestBundleInfo manifestBundle = fs.GetManifestBundle(bundle.Name);
-                        string catalog = fs.GetCatalog(manifestBundle.files[0].file);
+                        string catalog;
+                        if (manifestBundle.files.Count == 0)
+                        {
+                            catalog = fs.GetCatalog(new ManifestFileRef(1, false, 0));
+                        }
+                        else
+                        {
+                            catalog = fs.GetCatalog(manifestBundle.files[0].file);
+                        }
 
                         if (!tasks.ContainsKey(catalog))
                             tasks.Add(catalog, new List<ModBundleInfo>());
@@ -1775,47 +1871,33 @@ namespace Frosty.ModSupport
                         tasks[catalog].Add(bundle);
                     }
 
-                    int totalTasks = 0;
-                    foreach (List<ModBundleInfo> task in tasks.Values)
+                    ReportProgress(0, tasks.Count);
+                    Parallel.ForEach(tasks.Values, new ParallelOptions() { MaxDegreeOfParallelism = Environment.ProcessorCount }, task =>
                     {
-                        ManifestBundleAction action = new ManifestBundleAction(task, doneEvent, this, cancelToken);
-                        ThreadPool.QueueUserWorkItem(action.ThreadPoolCallback, null);
-                        actions.Add(action);
-                        numTasks++;
-                        totalTasks++;
-                    }
+                        actions.Add(new ManifestBundleAction(task, this, cancelToken));
+                        ReportProgress(actions.Count, tasks.Count);
+                    });
 
-                    while (numTasks != 0)
+                    foreach (ManifestBundleAction action in actions)
                     {
-                        // show progress
-                        cancelToken.ThrowIfCancellationRequested();
-                        logger.Log("progress:" + ((totalTasks - numTasks) / (double)totalTasks) * 100.0d);
-                        Thread.Sleep(1);
-                    }
-
-                    foreach (ManifestBundleAction completedAction in actions)
-                    {
-                        if (completedAction.HasErrored)
+                        if (action.Exception != null)
                         {
                             // if any of the threads caused an exception, throw it to the global handler
                             // as the game data is now in an inconsistent state
-                            throw completedAction.Exception;
+                            FileLogger.Info("Adding manifests for SWBF2 in parallel resultet in an exception");
+
+                            throw action.Exception;
                         }
 
-                        if (completedAction.DataRefs.Count > 0)
+                        if (action.DataRefs.Count > 0)
                         {
-                            // add bundle data to archive
-                            for (int i = 0; i < completedAction.BundleRefs.Count; i++)
-                            {
-                                if (!archiveData.ContainsKey(completedAction.BundleRefs[i]))
-                                    archiveData.Add(completedAction.BundleRefs[i], new ArchiveInfo() { Data = completedAction.BundleBuffers[i] });
-                            }
-
                             // add refs to be added to cas (and manifest)
-                            for (int i = 0; i < completedAction.DataRefs.Count; i++)
-                                casData.Add(fs.GetCatalog(completedAction.FileInfos[i].FileInfo.file), completedAction.DataRefs[i], completedAction.FileInfos[i].Entry, completedAction.FileInfos[i].FileInfo);
+                            for (int i = 0; i < action.DataRefs.Count; i++)
+                                casData.Add(fs.GetCatalog(action.FileInfos[i].FileInfo.file), action.DataRefs[i], action.FileInfos[i].Entry, action.FileInfos[i].FileInfo);
                         }
                     }
+
+                    FileLogger.Info("Processing manifest chunk changes for SWBF2");
 
                     // now process manifest chunk changes
                     if (modifiedBundles.ContainsKey(chunksBundleHash))
@@ -1882,7 +1964,7 @@ namespace Frosty.ModSupport
                     {
                         // show progress
                         cancelToken.ThrowIfCancellationRequested();
-                        logger.Log("progress:" + ((totalTasks - numTasks) / (double)totalTasks) * 100.0d);
+                        ReportProgress(totalTasks - numTasks, totalTasks);
                         Thread.Sleep(1);
                     }
 
@@ -1898,7 +1980,7 @@ namespace Frosty.ModSupport
                         if (!completedAction.TocModified)
                         {
                             string srcPath = fs.ResolvePath(completedAction.SuperBundle + ".toc");
-                            FileInfo sbFi = new FileInfo(modPath + patchPath + "/" + completedAction.SuperBundle + ".toc");
+                            FileInfo sbFi = new FileInfo(modDataPath + patchPath + "/" + completedAction.SuperBundle + ".toc");
 
                             if (!Directory.Exists(sbFi.DirectoryName))
                                 Directory.CreateDirectory(sbFi.DirectoryName);
@@ -1909,7 +1991,7 @@ namespace Frosty.ModSupport
                         if (!completedAction.SbModified)
                         {
                             string srcPath = fs.ResolvePath(completedAction.SuperBundle + ".sb");
-                            FileInfo sbFi = new FileInfo(modPath + patchPath + "/" + completedAction.SuperBundle + ".sb");
+                            FileInfo sbFi = new FileInfo(modDataPath + patchPath + "/" + completedAction.SuperBundle + ".sb");
 
                             if (!Directory.Exists(sbFi.DirectoryName))
                                 Directory.CreateDirectory(sbFi.DirectoryName);
@@ -1935,6 +2017,14 @@ namespace Frosty.ModSupport
                 // reset threadpool
                 ThreadPool.SetMaxThreads(workerThreads, completionPortThreads);
 
+                Logger.Log("Writing archive data");
+                App.Logger.Log("Writing archive data");
+                FileLogger.Info("Writing archive data");
+
+                int totalEntries = casData.GetEntryCount();
+                int currentEntry = 0;
+                ReportProgress(currentEntry, totalEntries);
+
                 // write out cas and modify cats
                 foreach (CasDataEntry entry in casData.EnumerateEntries())
                 {
@@ -1942,18 +2032,18 @@ namespace Frosty.ModSupport
                         continue;
 
                     cancelToken.ThrowIfCancellationRequested();
-                    if (!File.Exists(modPath + patchPath + "\\" + entry.Catalog + "\\cas.cat"))
+                    if (!File.Exists(modDataPath + patchPath + "\\" + entry.Catalog + "\\cas.cat"))
                     {
                         if (!File.Exists(fs.BasePath + "data\\" + entry.Catalog + "\\cas.cat"))
                             continue;
 
                         using (NativeReader reader = new NativeReader(new FileStream(fs.BasePath + "data\\" + entry.Catalog + "\\cas.cat", FileMode.Open, FileAccess.Read)))
                         {
-                            FileInfo fi = new FileInfo(modPath + patchPath + "\\" + entry.Catalog + "\\cas.cat");
+                            FileInfo fi = new FileInfo(modDataPath + patchPath + "\\" + entry.Catalog + "\\cas.cat");
                             if (!fi.Directory.Exists)
                                 Directory.CreateDirectory(fi.Directory.FullName);
 
-                            using (NativeWriter writer = new NativeWriter(new FileStream(modPath + patchPath + "\\" + entry.Catalog + "\\cas.cat", FileMode.Create)))
+                            using (NativeWriter writer = new NativeWriter(new FileStream(modDataPath + patchPath + "\\" + entry.Catalog + "\\cas.cat", FileMode.Create)))
                             {
                                 writer.Write(reader.ReadBytes(0x23C));
                                 writer.Write(0x00);
@@ -1969,25 +2059,32 @@ namespace Frosty.ModSupport
                         }
                     }
 
-                    WriteArchiveData(modPath + patchPath + "\\" + entry.Catalog, entry);
+                    WriteArchiveData(modDataPath + patchPath + "\\" + entry.Catalog, entry);
+
+                    ReportProgress(currentEntry++, totalEntries);
                 }
 
                 cancelToken.ThrowIfCancellationRequested();
 
+                Logger.Log("Writing manifest");
+                App.Logger.Log("Writing manifest");
+                FileLogger.Info("Writing manifest");
+
                 // finally copy in the left over patch data
-                CopyFileIfRequired(fs.BasePath + patchPath + "/initfs_win32", modPath + patchPath + "/initfs_win32");
+                CopyFileIfRequired(fs.BasePath + patchPath + "/initfs_win32", modDataPath + patchPath + "/initfs_win32");
 
                 if (ProfilesLibrary.DataVersion == (int)ProfileVersion.DragonAgeInquisition || ProfilesLibrary.DataVersion == (int)ProfileVersion.Battlefield4 || ProfilesLibrary.DataVersion == (int)ProfileVersion.NeedForSpeed || ProfilesLibrary.DataVersion == (int)ProfileVersion.PlantsVsZombiesGardenWarfare2 || ProfilesLibrary.DataVersion == (int)ProfileVersion.NeedForSpeedRivals)
                 {
+                    FileLogger.Info($"Modify layout.toc at '{fs.BasePath + patchPath + "/layout.toc"}'");
                     // modify layout.toc for any new superbundles added
                     DbObject layout = null;
                     using (DbReader reader = new DbReader(new FileStream(fs.BasePath + patchPath + "/layout.toc", FileMode.Open, FileAccess.Read), fs.CreateDeobfuscator()))
                         layout = reader.ReadDbObject();
 
-                    foreach (string path in Directory.EnumerateFiles(modPath + patchPath, "*.sb", SearchOption.AllDirectories))
+                    foreach (string path in Directory.EnumerateFiles(modDataPath + patchPath, "*.sb", SearchOption.AllDirectories))
                     {
                         // remove path, and extension and replace \ with /
-                        string sbName = path.Replace(modPath + patchPath + "\\", "").Replace("\\", "/").Replace(".sb", "");
+                        string sbName = path.Replace(modDataPath + patchPath + "\\", "").Replace("\\", "/").Replace(".sb", "");
                         foreach (DbObject entry in layout.GetValue<DbObject>("superBundles"))
                         {
                             if (entry.GetValue<string>("name").Equals(sbName, StringComparison.OrdinalIgnoreCase))
@@ -1998,14 +2095,17 @@ namespace Frosty.ModSupport
                         }
                     }
 
-                    using (DbWriter writer = new DbWriter(new FileStream(modPath + patchPath + "/layout.toc", FileMode.Create), true))
+                    using (DbWriter writer = new DbWriter(new FileStream(modDataPath + patchPath + "/layout.toc", FileMode.Create), true))
                         writer.Write(layout);
                 }
                 else if (ProfilesLibrary.DataVersion != (int)ProfileVersion.Fifa19 && ProfilesLibrary.DataVersion != (int)ProfileVersion.Madden20 && ProfilesLibrary.DataVersion != (int)ProfileVersion.Fifa20)
                 {
                     DbObject layout = null;
-                    using (DbReader reader = new DbReader(new FileStream(fs.ResolvePath("layout.toc"), FileMode.Open, FileAccess.Read), fs.CreateDeobfuscator()))
+                    var layoutPath = fs.ResolvePath("layout.toc");
+                    using (DbReader reader = new DbReader(new FileStream(layoutPath, FileMode.Open, FileAccess.Read), fs.CreateDeobfuscator()))
                         layout = reader.ReadDbObject();
+
+                    FileLogger.Info($"Modify layout.toc at '{layoutPath}'");
 
                     // write out new manifest
                     if (ProfilesLibrary.DataVersion == (int)ProfileVersion.StarWarsBattlefrontII || ProfilesLibrary.DataVersion == (int)ProfileVersion.Battlefield5)
@@ -2018,18 +2118,23 @@ namespace Frosty.ModSupport
 
                         // find the next available cas
                         int casIndex = 1;
-                        while (File.Exists(modPath + patchPath + "/" + (string.Format("{0}\\cas_{1}.cas", catalog, casIndex.ToString("D2")))))
+                        while (File.Exists(modDataPath + patchPath + "/" + string.Format("{0}\\cas_{1}.cas", catalog, casIndex.ToString("D2"))))
+                        {
                             casIndex++;
+                        }
 
                         Sha1 sha1 = Utils.GenerateSha1(tmpBuf);
 
-                        archiveData.Add(sha1, new ArchiveInfo() { Data = tmpBuf });
-                        WriteArchiveData(modPath + patchPath + "/" + catalog, new CasDataEntry("", sha1));
+                        archiveData.TryAdd(sha1, new ArchiveInfo() { Data = tmpBuf });
+                        WriteArchiveData(modDataPath + patchPath + "/" + catalog, new CasDataEntry("", sha1));
 
                         manifest.SetValue("size", tmpBuf.Length);
                         manifest.SetValue("offset", 0);
                         manifest.SetValue("sha1", sha1);
-                        manifest.SetValue("file", (int)new ManifestFileRef(fileRef.CatalogIndex, true, casIndex));
+                        if (ProfilesLibrary.DataVersion == (int)ProfileVersion.Battlefield5) //more patch directory shenanigans
+                            manifest.SetValue("file", (int)new ManifestFileRef(fileRef.CatalogIndex, false, casIndex));
+                        else
+                            manifest.SetValue("file", (int)new ManifestFileRef(fileRef.CatalogIndex, true, casIndex));
                     }
 
                     // add any new superbundles
@@ -2046,9 +2151,11 @@ namespace Frosty.ModSupport
                         }
                     }
 
-                    string layoutLocation = modPath + patchPath + "/layout.toc";
+                    string layoutLocation = modDataPath + patchPath + "/layout.toc";
                     if (ProfilesLibrary.DataVersion == (int)ProfileVersion.StarWarsBattlefrontII || ProfilesLibrary.DataVersion == (int)ProfileVersion.Battlefield5)
-                        layoutLocation = modPath + "Data/layout.toc";
+                        layoutLocation = modDataPath + "Data/layout.toc";
+
+                    FileLogger.Info($"Write layout.toc at '{layoutLocation}'");
 
                     using (DbWriter writer = new DbWriter(new FileStream(layoutLocation, FileMode.Create), true))
                         writer.Write(layout);
@@ -2057,33 +2164,65 @@ namespace Frosty.ModSupport
                 if (ProfilesLibrary.DataVersion == (int)ProfileVersion.Fifa17 || ProfilesLibrary.DataVersion == (int)ProfileVersion.DragonAgeInquisition || ProfilesLibrary.DataVersion == (int)ProfileVersion.Battlefield4 || ProfilesLibrary.DataVersion == (int)ProfileVersion.NeedForSpeed || ProfilesLibrary.DataVersion == (int)ProfileVersion.PlantsVsZombiesGardenWarfare2 || ProfilesLibrary.DataVersion == (int)ProfileVersion.NeedForSpeedRivals)
                 {
                     // copy additional files
-                    CopyFileIfRequired(fs.BasePath + patchPath + "/../package.mft", modPath + patchPath + "/../package.mft");
+                    CopyFileIfRequired(fs.BasePath + patchPath + "/../package.mft", modDataPath + patchPath + "/../package.mft");
                 }
 
                 if (ProfilesLibrary.DataVersion == (int)ProfileVersion.StarWarsBattlefrontII || ProfilesLibrary.DataVersion == (int)ProfileVersion.Battlefield5)
                 {
                     // copy from old data to new data
-                    CopyFileIfRequired(fs.BasePath + "Data/chunkmanifest", modPath + "Data/chunkmanifest");
-                    CopyFileIfRequired(fs.BasePath + "Data/initfs_Win32", modPath + "Data/initfs_Win32");
+                    CopyFileIfRequired(fs.BasePath + "Data/chunkmanifest", modDataPath + "Data/chunkmanifest");
+                    CopyFileIfRequired(fs.BasePath + "Data/initfs_Win32", modDataPath + "Data/initfs_Win32");
                 }
 
                 // create the frosty mod list file
-                File.WriteAllText(Path.Combine(modPath, patchPath, "mods.json"), JsonConvert.SerializeObject(GenerateModInfoList(modPaths, rootPath), Formatting.Indented));
+
+                var newModSetup = new ModSetup
+                {
+                    IsHardlink = ShouldUseHardLink(),
+                    ModInfos = GenerateModInfoList(modPaths, rootPath),
+                };
+
+                File.WriteAllText(Path.Combine(modDataPath, patchPath, "mods.json"), JsonConvert.SerializeObject(newModSetup, Formatting.Indented));
+
+                // stopwatch
+                watch.Stop();
+                App.Logger.Log($"Applied mods in {watch.Elapsed.Minutes}m {watch.Elapsed.Seconds}s");
+                FileLogger.Info("Applied mods");
+            }
+            else
+            {
+                App.Logger.Log("Launching with previously generated data.");
+                FileLogger.Info("Leaving previously generated data");
             }
 
             cancelToken.ThrowIfCancellationRequested();
 
-            // DAI and NFS dont require bcrypt
-            if (ProfilesLibrary.DataVersion != (int)ProfileVersion.DragonAgeInquisition && ProfilesLibrary.DataVersion != (int)ProfileVersion.Battlefield4 && ProfilesLibrary.DataVersion != (int)ProfileVersion.NeedForSpeed && ProfilesLibrary.DataVersion != (int)ProfileVersion.NeedForSpeedRivals)
+            // NFS dont require bcrypt
+            if (ProfilesLibrary.DataVersion != (int)ProfileVersion.Battlefield4 && ProfilesLibrary.DataVersion != (int)ProfileVersion.NeedForSpeed && ProfilesLibrary.DataVersion != (int)ProfileVersion.NeedForSpeedRivals)
             {
                 // delete old useless bcrypt
                 if (File.Exists(fs.BasePath + "bcrypt.dll"))
+                {
                     File.Delete(fs.BasePath + "bcrypt.dll");
+                }
 
-                // copy over new CryptBase
-                CopyFileIfRequired("ThirdParty/CryptBase.dll", fs.BasePath + "CryptBase.dll");
+                if (OperatingSystemHelper.IsWine())
+                {
+                    CopyFileIfRequired("ThirdParty/winmm.dll", fs.BasePath + "winmm.dll");
+                    CopyFileIfRequired("ThirdParty/crypthook.dll", fs.BasePath + "crypthook.dll");
+                }
+                else
+                {
+                    CopyFileIfRequired("ThirdParty/CryptBase.dll", fs.BasePath + "cryptbase.dll");
+                }
             }
-            CopyFileIfRequired(fs.BasePath + "user.cfg", modPath + "user.cfg");
+
+            CopyFileIfRequired(fs.BasePath + "user.cfg", modDataPath + "user.cfg");
+
+            if (!ShouldUseHardLink() && Config.Get<bool>("EASetup", false))
+            {
+                LinkEaMods(fs.BasePath, modDataPath);
+            }
 
             // FIFA games require a fifaconfig workaround
             if (ProfilesLibrary.DataVersion == (int)ProfileVersion.Fifa17 || ProfilesLibrary.DataVersion == (int)ProfileVersion.Fifa18 || ProfilesLibrary.DataVersion == (int)ProfileVersion.Fifa19 || ProfilesLibrary.DataVersion == (int)ProfileVersion.Fifa20)
@@ -2098,13 +2237,132 @@ namespace Frosty.ModSupport
                 CopyFileIfRequired("thirdparty/fifaconfig.exe", fs.BasePath + "FIFASetup\\fifaconfig.exe");
             }
 
-            // launch the game (redirecting to the modPath directory)
-            Logger.Log("Launching game");
+            FileLogger.Info("Mod installation finished.");
 
-            ExecuteProcess($"{fs.BasePath + ProfilesLibrary.ProfileName}.exe", $"-dataPath \"{modPath.Trim('\\')}\" {additionalArgs}");
+            return 0;
+        }
+
+        public int Install(FileSystem inFs, CancellationToken cancelToken, FrostyTaskLogger inLogger, string rootPath, string modPackName, params string[] modPaths)
+        {
+            modDirName = "ModData\\" + modPackName;
+            cancelToken.ThrowIfCancellationRequested();
+
+            App.Logger.Log("Launching");
+
+            fs = inFs;
+            Logger = inLogger;
+
+            string modDataPath = fs.BasePath + modDirName + "\\";
+            int installRes;
+
+            try
+            {
+                installRes = InstallMods(cancelToken, rootPath, modDataPath, modPackName, modPaths);
+            }
+            catch (OperationCanceledException oce)
+            {
+                throw oce;
+            }
+            catch (Exception e)
+            {
+                FileLogger.Info($"Caught exception during mod installation. Details: {e}");
+                FrostyMessageBox.Show($"Mod installation encountered exception of type {e.GetType()}. Check 'executor.log' file in Frosty directory for more details.\r\n", "Mod installation failed");
+                return -1;
+            }
+
+            if (installRes != 0)
+            {
+                return installRes;
+            }
+
+            Logger.Log("Mods installed.");
+            App.Logger.Log("Mods installed.");
 
             GC.Collect();
             return 0;
+        }
+
+        public int Run(FileSystem inFs, CancellationToken cancelToken, FrostyTaskLogger inLogger, string rootPath, string modPackName, string additionalArgs, params string[] modPaths)
+        {
+            modDirName = "ModData\\" + modPackName;
+            cancelToken.ThrowIfCancellationRequested();
+
+            App.Logger.Log("Launching");
+
+            fs = inFs;
+            Logger = inLogger;
+
+            string modDataPath = fs.BasePath + modDirName + "\\";
+
+            int installRes;
+            try
+            {
+                installRes = InstallMods(cancelToken, rootPath, modDataPath, modPackName, modPaths);
+            }
+            catch (OperationCanceledException oce)
+            {
+                throw oce;
+            }
+            catch (Exception e)
+            {
+                FileLogger.Info($"Caught exception during mod installation. Details: {e}");
+                FrostyMessageBox.Show($"Mod installation encountered exception of type {e.GetType()}. Check 'executor.log' file in Frosty directory for more details.\r\n", "Mod installation failed");
+                return -1;
+            }
+
+            if (installRes != 0)
+            {
+                return installRes;
+            }
+
+            // launch the game (redirecting to the modPath directory)
+            Logger.Log("Launching Game");
+
+            try
+            {
+                LaunchGame(fs.BasePath, modDirName, modDataPath, additionalArgs);
+            }
+            catch (Exception ex)
+            {
+                App.Logger.Log("Error Launching Game: " + ex);
+            }
+
+            App.Logger.Log("Done");
+
+            GC.Collect();
+            return 0;
+        }
+
+        public static void LaunchGame(string basePath, string modDirName, string modDataPath, string additionalArgs)
+        {
+            string steamAppIdPath = $"{basePath}steam_appid.txt";
+            if (File.Exists(steamAppIdPath))
+            {
+                string steamAppId = File.ReadAllLines(steamAppIdPath).First();
+                string arguments = $"-dataPath \"{modDirName.Replace('\\', '/')}\" {additionalArgs}".Trim();
+                string url = Uri.EscapeDataString(arguments);
+                App.Logger.Log($"Launch: {arguments}");
+                App.Logger.Log($"Encoded: {url}");
+                Process.Start($"steam://run/{steamAppId}//{url}/");
+            }
+            else
+            {
+                ExecuteProcess($"{basePath + ProfilesLibrary.ProfileName}.exe", $"-dataPath \"{modDataPath.Trim('\\')}\" {additionalArgs}");
+            }
+        }
+
+        private void LinkEaMods(string gamePath, string modDataPath)
+        {
+            var eaModsPath = Path.Combine(gamePath, "EAMods");
+
+            var symLink = new SymLinkStruct(eaModsPath, modDataPath, true);
+
+            var links = new List<SymLinkStruct>
+            {
+                symLink
+            };
+
+            RunSymbolicLinkProcess(links);
         }
 
         private List<ModInfo> GenerateModInfoList(string[] modPaths, string rootPath)
@@ -2179,8 +2437,18 @@ namespace Frosty.ModSupport
             {
                 ArchiveInfo info = archiveData[sha1];
 
-                // if cas exceeds 1gb in size, create a new one (incrementing index)
-                if (currentCasStream == null || ((totalSize + info.Data.Length) > 1073741824))
+                int casMaxBytes = 536870912;
+                switch (Config.Get("MaxCasFileSize", "1GB"))
+                {
+                    case "1GB": casMaxBytes = 1073741824; break;
+                    case "512MB": casMaxBytes = 536870912; break;
+                    case "256MB": casMaxBytes = 268435456; break;
+                }
+
+                // FileLogger.Info($"Writing data for cas index {casIndex}...");
+
+                // if cas exceeds max size, create a new one (incrementing index)
+                if (currentCasStream == null || ((totalSize + info.Data.Length) > casMaxBytes))
                 {
                     if (currentCasStream != null)
                     {
@@ -2220,7 +2488,15 @@ namespace Frosty.ModSupport
                         casEntry.FileInfo.offset = (uint)currentCasStream.Position;
                         casEntry.FileInfo.size = info.Data.Length;
                     }
-                    casEntry.FileInfo.file = new ManifestFileRef(casEntry.FileInfo.file.CatalogIndex, true, casIndex);
+
+                    if (ProfilesLibrary.DataVersion == (int)ProfileVersion.Battlefield5)
+                    {
+                        casEntry.FileInfo.file = new ManifestFileRef(casEntry.FileInfo.file.CatalogIndex, false, casIndex);
+                    }
+                    else
+                    {
+                        casEntry.FileInfo.file = new ManifestFileRef(casEntry.FileInfo.file.CatalogIndex, true, casIndex);
+                    }
                 }
 
                 currentCasStream.Write(info.Data, 0, info.Data.Length);
@@ -2279,12 +2555,17 @@ namespace Frosty.ModSupport
                         numEntries++;
                     }
 
-                    int offset = 0;
-                    int index = 0;
+                    int offset = 0, index = 0, currentCasIndex = casEntries.Count > 0 ? casEntries[0] : 1;
 
                     // new entries
                     foreach (Sha1 sha1 in casDataEntry.EnumerateDataRefs())
                     {
+                        if (currentCasIndex != casEntries[index])
+                        {
+                            offset = 0;
+                            currentCasIndex = casEntries[index];
+                        }
+
                         if (ProfilesLibrary.DataVersion == (int)ProfileVersion.DragonAgeInquisition || ProfilesLibrary.DataVersion == (int)ProfileVersion.Battlefield4 || ProfilesLibrary.DataVersion == (int)ProfileVersion.NeedForSpeed || ProfilesLibrary.DataVersion == (int)ProfileVersion.NeedForSpeedRivals)
                             offset += 0x20;
 
@@ -2352,31 +2633,48 @@ namespace Frosty.ModSupport
 
         private bool DeleteSelectFiles(string modPath)
         {
+            FileLogger.Info($"Start selected files deletion at '{modPath}'");
+
             DirectoryInfo di = new DirectoryInfo(modPath);
-            if (di.Exists)
+
+            if (!di.Exists)
             {
-                RecursiveDeleteFiles(modPath);
-                foreach (string catalog in fs.Catalogs)
+                FileLogger.Info("Canceled selected files deletion as path does not exists");
+                return false;
+            }
+
+            RecursiveDeleteFiles(modPath);
+            foreach (string catalog in fs.Catalogs)
+            {
+                string basePatchCatalog = fs.ResolvePath("native_patch/" + catalog);
+                if (ProfilesLibrary.DataVersion == (int)ProfileVersion.Battlefield5) //woo patch folder
+                    basePatchCatalog = fs.ResolvePath("native_data/" + catalog);
+                string modDataCatalog = $"{modPath}/{catalog}";
+
+                if (!Directory.Exists(modDataCatalog))
                 {
-                    string basePatchCatalog = fs.ResolvePath("native_patch/" + catalog);
-                    string modDataCatalog = $"{modPath}/{catalog}";
-
-                    if (Directory.Exists(modDataCatalog))
-                    {
-                        foreach (string filename in Directory.EnumerateFiles(modDataCatalog))
-                        {
-                            FileInfo fi = new FileInfo(filename);
-
-                            // delete if cas does not exist in base patch OR is not a symbolic link
-                            if (!File.Exists(basePatchCatalog + "/" + fi.Name) || (fi.Attributes & FileAttributes.ReparsePoint) == 0)
-                                File.Delete(fi.FullName);
-                        }
-                    }
+                    continue;
                 }
 
-                return true;
+                //TODO: multi thread with batches
+                var files = Directory.GetFiles(modDataCatalog);
+
+                foreach (string file in files)
+                {
+                    var fileName = Path.GetFileName(file);
+
+                    // delete if cas does not exist in base patch OR is not a symbolic link
+                    if (!File.Exists(Path.Combine(basePatchCatalog, fileName)) || !SymLinkHelper.IsSymbolicLink(file))
+                    {
+                        FileLogger.Info($"Removing file '{file}'.");
+                        SymLinkHelper.DeleteFileSafe(file);
+                    }
+                }
             }
-            return false;
+
+            FileLogger.Info("Finished selected files deletion");
+
+            return true;
         }
 
         private bool IsSamePatch(string modPath)
@@ -2411,47 +2709,168 @@ namespace Frosty.ModSupport
                 if (patchHead == 0xBDFB3 && modHead != patchHead)
                 {
                     // SWBF2 new layout requires completely rebuilding ModData from scratch
-                    Directory.Delete(modPath + "../", true);
+                    SymLinkHelper.DeleteDirectorySafe(Path.Combine(modPath, "../"));
                     return false;
                 }
             }
 
             if (modHead != patchHead)
             {
-                Directory.Delete(modPath + "../", true);
+                SymLinkHelper.DeleteDirectorySafe(Path.Combine(modPath, "../"));
                 return false;
             }
 
             return true;
         }
 
-        private void RecursiveDeleteFiles(string path)
+        private static void RecursiveDeleteFiles(string path)
         {
-            DirectoryInfo di = new DirectoryInfo(path);
-
-            DirectoryInfo[] paths = di.GetDirectories();
-            FileInfo[] files = di.GetFiles();
-            foreach (FileInfo fi in files)
+            if (!Directory.Exists(path))
             {
-                // delete all cat/toc/sb files and the initfs_win32 and mods file
-                if (fi.Extension == ".cat" || fi.Extension == ".toc" || fi.Extension == ".sb" || fi.Name.ToLower() == "mods.txt" || fi.Name.ToLower() == "mods.json")
-                {
-                    // dont delete layout.toc
-                    if (fi.Name.ToLower() == "layout.toc")
-                        continue;
-
-                    fi.Delete();
-                }
+                return;
             }
 
-            foreach (DirectoryInfo subDi in paths)
+            var dirs = new List<string>{ path };
+            
+            while (dirs.Count > 0)
             {
-                string tempPath = Path.Combine(path, subDi.Name);
-                RecursiveDeleteFiles(tempPath);
+                var newDirs = new List<string>();
+                var files = new List<string>();
+
+                foreach (var dir in dirs)
+                {
+                    files.AddRange(Directory.GetFiles(dir));
+                    newDirs.AddRange(Directory.GetDirectories(dir));
+                }
+
+                dirs.Clear();
+                dirs.AddRange(newDirs);
+
+                files = files.Where(f => ShouldFileBeRecursiveDeleted(f)).ToList();
+
+                FileLogger.Info($"Removing {files.Count} files.");
+
+                var batches = BatchesHelper.Split(files, SymLinkHelper.BatchSize);
+
+                foreach (var batch in batches)
+                {
+                    var tasks = batch.Select(f => Task.Run(() => SymLinkHelper.DeleteFileSafe(f))).ToArray();
+                    
+                    try
+                    {
+                        Task.WaitAll(tasks);
+                    }
+                    catch (AggregateException ax)
+                    {
+                        SymLinkHelper.HandleAggregateException(ax);
+                    }
+                }
             }
         }
 
+        private static bool ShouldFileBeRecursiveDeleted(string path)
+        {
+            var fileName = Path.GetFileName(path).ToLower();
+            var extension = Path.GetExtension(path).ToLower();
+
+            if (fileName == "layout.toc")
+            {
+                return false;
+            }
+
+            if (extension == ".cat" || extension == ".toc" || extension == ".sb")
+            {
+                return true;
+            }
+
+            if (fileName == "mods.txt" || fileName == "mods.json")
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        private bool ShouldCleanModDir(string modPath)
+        {
+            if (ShouldUseHardLink())
+            {
+                return true;
+            }
+
+            FileLogger.Info("Sym Link search started.");
+
+            var result = SymLinkHelper.DoesDirectoryContainSymLinks(modPath);
+
+            FileLogger.Info($"Sym Link search finished with result: {result}.");
+
+            return !result;
+        }
+
         private bool RunSymbolicLinkProcess(List<SymLinkStruct> cmdArgs)
+        {
+            DeleteLinkDestinations(cmdArgs);
+
+            if (ShouldUseHardLink())
+            {
+                FileLogger.Info("Using hard linking.");
+                CreateHardLinksStructure(cmdArgs);
+            }
+            else if (OperatingSystemHelper.IsWine())
+            {
+                FileLogger.Info("Using Linux symbolic linking.");
+                CreateSymbolicLinksStructureLinux(cmdArgs);
+            }
+            else
+            {
+                FileLogger.Info("Using symbolic linking.");
+                CreateSymbolicLinksStructure(cmdArgs);
+            }
+
+            FileLogger.Info("Linking finished.");
+
+            return true;
+        }
+
+        private bool ShouldUseHardLink()
+        {
+            if (!SymLinkHelper.AreHardLinksSupported)
+            {
+                FileLogger.Info("Hard Link is not supported on this platform.");
+                return false;
+            }
+
+            if (Config.Get<bool>("UseHardLink", true))
+            {
+                return true;
+            }
+
+            if (SymLinkHelper.AreSymLinksSupported)
+            {
+                return false;
+            }
+
+            FileLogger.Info("Hardlink required.");
+
+            return true;
+        }
+
+        private void DeleteLinkDestinations(List<SymLinkStruct> cmdArgs)
+        {
+            foreach (var arg in cmdArgs)
+            {
+                if (arg.isFolder)
+                {
+                    SymLinkHelper.DeleteDirectorySafe(arg.dest);
+                }
+                else
+                {
+                    SymLinkHelper.DeleteFileSafe(arg.dest);
+                }
+            }
+        }
+
+        private void CreateSymbolicLinksStructure(List<SymLinkStruct> cmdArgs)
         {
             using (TextWriter writer = new StreamWriter(new FileStream(AppDomain.CurrentDomain.BaseDirectory + "\\run.bat", FileMode.Create)))
             {
@@ -2464,15 +2883,66 @@ namespace Frosty.ModSupport
 
             // delete batch
             File.Delete("run.bat");
+        }
 
-            // validate
+        private void CreateSymbolicLinksStructureLinux(List<SymLinkStruct> cmdArgs)
+        {
+            var adjustedCmdArgs = cmdArgs.Select(c => new SymLinkStruct(SymLinkHelper.GetRealPath(c.dest), SymLinkHelper.GetRealPath(c.src), c.isFolder)).ToList();
+
+            var batches = BatchesHelper.Split(adjustedCmdArgs, SymLinkHelper.BatchSize);
+
+            foreach (var batch in batches)
+            {
+                var symTasks = batch.Select(c => Task.Run(() => SymLinkHelper.CreateSymlinkLinux(c.src, c.dest, false))).ToArray();
+
+                try
+                {
+                    Task.WaitAll(symTasks);
+                }
+                catch (AggregateException ax)
+                {
+                    SymLinkHelper.HandleAggregateException(ax);
+                }
+            }
+        }
+
+        private void CreateHardLinksStructure(List<SymLinkStruct> cmdArgs)
+        {
             foreach (SymLinkStruct arg in cmdArgs)
             {
-                if ((arg.isFolder && !Directory.Exists(arg.dest)) || (!arg.isFolder && !File.Exists(arg.dest)))
-                    return false;
+                try
+                {
+                    if (arg.isFolder)
+                    {
+                        CloneDirectory(arg.src, arg.dest);
+                    }
+                    else
+                    {
+                        SymLinkHelper.CreateHardLink(arg.src, arg.dest);
+                    }
+                }
+                catch { }
+            }
+        }
+
+        private static void CloneDirectory(string root, string dest)
+        {
+            Directory.CreateDirectory(dest);
+
+            foreach (var directory in Directory.GetDirectories(root))
+            {
+                //Get the path of the new directory
+                var newDirectory = Path.Combine(dest, Path.GetFileName(directory));
+                //Create the directory if it doesn't already exist
+                Directory.CreateDirectory(newDirectory);
+                //Recursively clone the directory
+                CloneDirectory(directory, newDirectory);
             }
 
-            return true;
+            foreach (var file in Directory.GetFiles(root))
+            {
+                SymLinkHelper.CreateHardLink(file, Path.Combine(dest, Path.GetFileName(file)));
+            }
         }
 
         public static void ExecuteProcess(string processName, string args, bool waitForExit = false, bool asAdmin = false, Dictionary<string, string> env = null)
@@ -2500,14 +2970,20 @@ namespace Frosty.ModSupport
                     process.StartInfo.Verb = "runas";
                 }
 
-                process.Start();
+                try
+                {
+                    process.Start();
 
-                if (waitForExit)
-                    process.WaitForExit();
+                    if (waitForExit)
+                        process.WaitForExit();
+                }
+                catch
+                {
+                }
             }
         }
 
-        private byte[] GetResourceData(string modFilename, int archiveIndex, long offset, int size)
+        private static byte[] GetResourceData(string modFilename, int archiveIndex, long offset, int size)
         {
             string archiveFilename = modFilename.Replace(".fbmod", "_" + archiveIndex.ToString("D2") + ".archive");
             if (!File.Exists(archiveFilename))
@@ -2527,8 +3003,10 @@ namespace Frosty.ModSupport
             if (baseFi.Exists)
             {
                 // copy file if it doesn't exist, or recently modified
-                if (!modFi.Exists || (modFi.Exists && baseFi.LastWriteTimeUtc > modFi.LastWriteTimeUtc || baseFi.Length != modFi.Length))
+                if (!modFi.Exists || (modFi.Exists && (baseFi.LastWriteTimeUtc > modFi.LastWriteTimeUtc || baseFi.Length != modFi.Length)))
+                {
                     File.Copy(baseFi.FullName, modFi.FullName, true);
+                }
             }
         }
     }

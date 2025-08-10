@@ -11,9 +11,6 @@ using FrostySdk.IO;
 using Frosty.Core;
 using Frosty.Core.Controls;
 using FrostyCore;
-using System.Text;
-using System.Linq;
-using Newtonsoft.Json;
 using System.Collections.Generic;
 
 namespace FrostyEditor
@@ -29,11 +26,16 @@ namespace FrostyEditor
         public static PluginManager PluginManager { get => Frosty.Core.App.PluginManager; set => Frosty.Core.App.PluginManager = value; }
         public static EbxAssetEntry SelectedAsset { get => Frosty.Core.App.SelectedAsset; set => Frosty.Core.App.SelectedAsset = value; }
         public static ILogger Logger { get => Frosty.Core.App.Logger; set => Frosty.Core.App.Logger = value; }
+        public static HashSet<int> WhitelistedBundles { get => Frosty.Core.App.WhitelistedBundles; set => Frosty.Core.App.WhitelistedBundles = value; }
 
         public static string SelectedPack { get => Frosty.Core.App.SelectedPack; set => Frosty.Core.App.SelectedPack = value; }
 
         public static string Version = "";
         public static long StartTime;
+
+        public static bool OpenProject { get; set; }
+
+        public static string LaunchArgs { get; private set; }
 
         private FrostyConfiguration defaultConfig;
 
@@ -41,6 +43,8 @@ namespace FrostyEditor
         {
             Assembly entryAssembly = Assembly.GetEntryAssembly();
             Version = entryAssembly.GetName().Version.ToString();
+
+            Environment.CurrentDirectory = AppDomain.CurrentDomain.BaseDirectory;
 
             Logger = new FrostyLogger();
             Logger.Log("Frosty Editor v{0}", Version);
@@ -55,8 +59,6 @@ namespace FrostyEditor
             // for displaying exception box on all unhandled exceptions
             DispatcherUnhandledException += App_DispatcherUnhandledException;
             Exit += Application_Exit;
-
-            string test = FrostyEditor.Properties.Resources.BuildDate;
 
 #if FROSTY_DEVELOPER
             Version += " (Developer)";
@@ -184,11 +186,51 @@ namespace FrostyEditor
             {
                 string prof = Config.Get<string>("DefaultProfile", null);
                 if (!string.IsNullOrEmpty(prof))
-                    defaultConfig = new FrostyConfiguration(prof);
+                {
+                    try
+                    {
+                        defaultConfig = new FrostyConfiguration(prof);
+                    }
+                    catch (System.IO.FileNotFoundException)
+                    {
+                        Config.RemoveGame(prof); // couldn't find the exe, so remove it from the profile list
+                        Config.Save();
+                    }
+                }
                 else
                 {
                     Config.Add("UseDefaultProfile", false);
                     Config.Save();
+                }
+            }
+
+            //check args to see if it is loading a project
+            if (e.Args.Length > 0)
+            {
+                string arg = e.Args[0];
+                if (arg.Contains(".fbproject"))
+                {
+                    OpenProject = true;
+                    LaunchArgs = arg;
+
+                    //get game profile from project file
+                    using (NativeReader reader = new NativeReader(new FileStream(arg, FileMode.Open, FileAccess.Read)))
+                    {
+                        if (reader.ReadULong() == 0x00005954534F5246)
+                        {
+                            reader.ReadUInt();
+                            string gameProfile = reader.ReadNullTerminatedString();
+                            try
+                            { 
+                                defaultConfig = new FrostyConfiguration(gameProfile); 
+                            }
+                            catch
+                            { 
+                                FrostyMessageBox.Show("There was an error when trying to load project using the profile: " + gameProfile, "Frosty Editor");
+                                OpenProject = false;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -239,7 +281,7 @@ namespace FrostyEditor
                     });
                 }
             }
-            catch (Exception e)
+            catch
             {
                 // System.Threading.Tasks.Task.Run(() => {
                 //     FrostyMessageBox.Show("Frosty Update Checker returned with an error:" + Environment.NewLine + e.Message, "Frosty Editor", MessageBoxButton.OK);

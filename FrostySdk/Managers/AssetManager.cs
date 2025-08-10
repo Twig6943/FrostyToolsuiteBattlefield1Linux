@@ -264,7 +264,7 @@ namespace FrostySdk.Managers
         /// <summary>
         /// Adds the current asset to the specified bundle
         /// </summary>
-        public bool AddToBundle(int bid)
+        public virtual bool AddToBundle(int bid)
         {
             if (IsInBundle(bid))
                 return false;
@@ -346,6 +346,8 @@ namespace FrostySdk.Managers
 
         public List<Guid> DependentAssets = new List<Guid>();
         public string UserData = "";
+
+        public bool IsDirty = false;
     }
 
     public class EbxAssetEntry : AssetEntry
@@ -406,6 +408,15 @@ namespace FrostySdk.Managers
         public int FirstMip;
         public bool IsTocChunk;
         public bool TocChunkSpecialHack;
+
+        public override bool AddToBundle(int bid)
+        {
+            if(Bundles.Count == 0 && !IsAdded)
+            {
+                return false;
+            }
+            return base.AddToBundle(bid);
+        }
     }
 
     public class AssetManagerImportResult
@@ -552,6 +563,12 @@ namespace FrostySdk.Managers
         #endregion
 
         private const ulong CacheMagic = 0x02005954534F5246;
+
+        /*
+          Cache Versions:
+            1 - Initial Version
+            2 - Nothing changed in the format just bumped up that the cache gets regenerated, bc bundled chunks did not always had their logical offset/size stored
+        */
         private const uint CacheVersion = 2;
 
         private FileSystem fs;
@@ -599,11 +616,15 @@ namespace FrostySdk.Managers
 
                 GC.Collect();
 
-                WriteToCache();
+                // if there is not additional startup or the ebxGuidList has items, write the cache
+                if (!additionalStartup || ebxGuidList.Count > 0)
+                {
+                    WriteToCache();
+                }
             }
 
             TimeSpan ElapsedTime = DateTime.Now - StartTime;
-            WriteToLog("Loading complete", ElapsedTime.ToString());
+            WriteToLog("Loading Complete", ElapsedTime.ToString());
 
             if (additionalStartup)
             {
@@ -691,7 +712,7 @@ namespace FrostySdk.Managers
                     )
                 {
                     // load class infos
-                    WriteToLog("Loading type info");
+                    WriteToLog("Loading Type Info");
                     TypeLibrary.Reflection.LoadClassInfoAssets(this);
                 }
             }
@@ -861,6 +882,20 @@ namespace FrostySdk.Managers
                 foreach (AssetEntry entry in mgr.EnumerateAssets(modifiedOnly: true))
                     RevertAsset(entry, suppressOnModify: false);
             }
+
+            //foreach(BundleEntry bundle in bundles.Where(b => b.Added).ToList())
+            //{
+            //    bundles.Remove(bundle);
+            //}
+            bundles.RemoveAll(b => b.Added);
+        }
+
+        public void RevertBundle(BundleEntry entry)
+        {
+            if (entry.Added)
+            {
+                bundles.Remove(entry);
+            }
         }
 
         public void RevertAsset(AssetEntry entry, bool dataOnly = false, bool suppressOnModify = true)
@@ -997,8 +1032,10 @@ namespace FrostySdk.Managers
             entry.ModifiedEntry.OriginalSize = 0;
             entry.ModifiedEntry.Sha1 = Sha1.Zero;
             entry.ModifiedEntry.IsInline = false;
+            entry.ModifiedEntry.IsDirty = true;
             entry.IsDirty = true;
             entry.IsAdded = true;
+            entry.AddedBundles.AddRange(bundles);
 
             ebxList.Add(keyName, entry);
             ebxGuidList.Add(entry.Guid, entry);
@@ -1037,6 +1074,8 @@ namespace FrostySdk.Managers
             };
 
             entry.ModifiedEntry.Sha1 = GenerateSha1(entry.ModifiedEntry.Data);
+            entry.ModifiedEntry.IsDirty = true;
+            entry.AddedBundles.AddRange(bundles);
 
             resList.Add(entry.Name, entry);
             resRidList.Add(entry.ResRid, entry);
@@ -1068,6 +1107,7 @@ namespace FrostySdk.Managers
                 entry.ModifiedEntry.RangeStart = texture.RangeStart;
                 entry.ModifiedEntry.RangeEnd = texture.RangeEnd;
                 entry.ModifiedEntry.FirstMip = texture.FirstMip;
+                entry.ModifiedEntry.IsDirty = true;
             }
 
 
@@ -1118,6 +1158,7 @@ namespace FrostySdk.Managers
                 entry.ModifiedEntry.RangeStart = texture.RangeStart;
                 entry.ModifiedEntry.RangeEnd = (uint)entry.ModifiedEntry.Data.Length;
                 entry.ModifiedEntry.FirstMip = texture.FirstMip;
+                entry.ModifiedEntry.IsDirty = true;
             }
 
             entry.IsDirty = true;
@@ -1142,6 +1183,7 @@ namespace FrostySdk.Managers
             entry.ModifiedEntry.Data = Utils.CompressFile(buffer, resType: (ResourceType)entry.ResType, compressionOverride: compressType);
             entry.ModifiedEntry.OriginalSize = buffer.Length;
             entry.ModifiedEntry.Sha1 = GenerateSha1(entry.ModifiedEntry.Data);
+            entry.ModifiedEntry.IsDirty = true;
 
             if (meta != null)
                 entry.ModifiedEntry.ResMeta = meta;
@@ -1154,7 +1196,7 @@ namespace FrostySdk.Managers
                 return;
 
             object modifiedResource = resource.SaveModifiedResource();
-            if (modifiedResource != null)
+            if (modifiedResource != null && !resRidList[resRid].IsAdded)
             {
                 ResAssetEntry entry = resRidList[resRid];
                 if (entry.ModifiedEntry == null)
@@ -1162,6 +1204,7 @@ namespace FrostySdk.Managers
 
                 entry.ModifiedEntry.DataObject = modifiedResource;
                 entry.ModifiedEntry.ResMeta = resource.ResourceMeta;
+                entry.ModifiedEntry.IsDirty = true;
                 entry.IsDirty = true;
             }
             else
@@ -1187,6 +1230,7 @@ namespace FrostySdk.Managers
             entry.ModifiedEntry.Data = Utils.CompressFile(buffer, resType: (ResourceType)entry.ResType, compressionOverride: compressType);
             entry.ModifiedEntry.OriginalSize = buffer.Length;
             entry.ModifiedEntry.Sha1 = GenerateSha1(entry.ModifiedEntry.Data);
+            entry.ModifiedEntry.IsDirty = true;
 
             if (meta != null)
                 entry.ModifiedEntry.ResMeta = meta;
@@ -1199,7 +1243,7 @@ namespace FrostySdk.Managers
                 return;
 
             object modifiedResource = resource.SaveModifiedResource();
-            if (modifiedResource != null)
+            if (modifiedResource != null && !resList[resName].IsAdded)
             {
                 ResAssetEntry entry = resList[resName];
                 if (entry.ModifiedEntry == null)
@@ -1207,6 +1251,7 @@ namespace FrostySdk.Managers
 
                 entry.ModifiedEntry.DataObject = modifiedResource;
                 entry.ModifiedEntry.ResMeta = resource.ResourceMeta;
+                entry.ModifiedEntry.IsDirty = true;
                 entry.IsDirty = true;
             }
             else
@@ -1236,6 +1281,7 @@ namespace FrostySdk.Managers
             entry.ModifiedEntry.IsTransientModified = asset.TransientEdit;
             entry.ModifiedEntry.DependentAssets.Clear();
             entry.ModifiedEntry.DependentAssets.AddRange(asset.Dependencies);
+            entry.ModifiedEntry.IsDirty = true;
             entry.IsDirty = true;
         }
 
@@ -1571,11 +1617,11 @@ namespace FrostySdk.Managers
                         ? null
                         : rm.GetRawResourceData(entry.Sha1);
 
-                //case AssetDataLocation.SuperBundle:
-                //    return rm.GetResourceData(((entry.ExtraData.IsPatch) ? "native_patch/" : "native_data/") + superBundles[entry.ExtraData.SuperBundleId].Name + ".sb", entry.ExtraData.DataOffset, entry.Size);
+                case AssetDataLocation.SuperBundle:
+                    return rm.GetRawResourceData(((entry.ExtraData.IsPatch) ? "native_patch/" : "native_data/") + superBundles[entry.ExtraData.SuperBundleId].Name + ".sb", entry.ExtraData.DataOffset, entry.Size);
 
-                //case AssetDataLocation.Cache:
-                //    return rm.GetResourceData(entry.ExtraData.DataOffset, entry.Size);
+                case AssetDataLocation.Cache:
+                    return rm.GetRawResourceData(entry.ExtraData.DataOffset, entry.Size);
 
                 case AssetDataLocation.CasNonIndexed:
                     return rm.GetRawResourceData(entry.ExtraData.CasPath, entry.ExtraData.DataOffset, entry.Size);
@@ -1700,6 +1746,14 @@ namespace FrostySdk.Managers
                     entry.IsInline = chunk.HasValue("idata");
                     //entry.H32 = chunkMeta.GetValue<int>("h32");
                     //entry.FirstMip = chunkMeta.GetValue<DbObject>("meta").GetValue<int>("firstMip");
+                }
+                else if (entry.LogicalSize == 0)
+                {
+                    entry.LogicalOffset = chunk.GetValue<uint>("logicalOffset");
+                    entry.LogicalSize = chunk.GetValue<uint>("logicalSize");
+                    entry.RangeStart = chunk.GetValue<uint>("rangeStart");
+                    entry.RangeEnd = chunk.GetValue<uint>("rangeEnd");
+                    entry.BundledSize = chunk.GetValue<uint>("bundledSize");
                 }
 
                 // Add to bundle
@@ -1981,7 +2035,7 @@ namespace FrostySdk.Managers
             if (!File.Exists(fs.CacheName + ".cache"))
                 return false;
 
-            WriteToLog("Loading data (" + fs.CacheName + ".cache)");
+            WriteToLog("Loading Data (" + fs.CacheName + ".cache)");
             bool bIsPatched = false;
 
             using (NativeReader reader = new NativeReader(new FileStream(fs.CacheName + ".cache", FileMode.Open, FileAccess.Read)))
@@ -2035,7 +2089,7 @@ namespace FrostySdk.Managers
                     };
 
                     // SWBF2: patch weapon bundles with incorrect start
-                    if (bentry.Name.StartsWith("win32/Win32"))
+                    if (bentry.Name.StartsWith("win32/Win32", StringComparison.InvariantCultureIgnoreCase))
                         bentry.Name = bentry.Name.Remove(0, 6);
 
                     if(!bIsPatched)
@@ -2093,10 +2147,22 @@ namespace FrostySdk.Managers
                         {
                             entry.Guid = ebxGuid;
                             if (ebxGuidList.ContainsKey(entry.Guid))
+                            {
                                 continue;
+                            }
+
                             ebxGuidList.Add(ebxGuid, entry);
                         }
-                        ebxList.Add(entry.Name, entry);
+
+                        if (ebxList.ContainsKey(entry.Name))
+                        {
+                            SdkFileLogger.Info($"Replacing '{entry.Name}' with display '{entry.DisplayName}' in ebxList.");
+                            ebxList[entry.Name] = entry;
+                        }
+                        else
+                        {
+                            ebxList.Add(entry.Name, entry);
+                        }
                     }
                 }
 
@@ -2140,9 +2206,28 @@ namespace FrostySdk.Managers
 
                     if (!bIsPatched)
                     {
-                        resList.Add(entry.Name, entry);
+                        if (resList.ContainsKey(entry.Name))
+                        {
+                            SdkFileLogger.Info($"Replacing '{entry.Name}' with display '{entry.DisplayName}' in resList.");
+                            resList[entry.Name] = entry;
+                        }
+                        else
+                        {
+                            resList.Add(entry.Name, entry);
+                        }
+
                         if (entry.ResRid != 0)
-                            resRidList.Add(entry.ResRid, entry);
+                        {
+                            if (resRidList.ContainsKey(entry.ResRid))
+                            {
+                                SdkFileLogger.Info($"Replacing '{entry.ResRid}' with name '{entry.Name}' and display '{entry.DisplayName}' in resRidList.");
+                                resRidList[entry.ResRid] = entry;
+                            }
+                            else
+                            {
+                                resRidList.Add(entry.ResRid, entry);
+                            }
+                        }
                     }
                 }
 
@@ -2200,7 +2285,17 @@ namespace FrostySdk.Managers
                         entry.Bundles.Add(reader.ReadInt());
 
                     if(!bIsPatched)
-                        chunkList.Add(entry.Id, entry);
+                    {
+                        if (chunkList.ContainsKey(entry.Id))
+                        {
+                            SdkFileLogger.Info($"Replacing '{entry.Id}' with name '{entry.Name}' and display '{entry.DisplayName}' in chunkList.");
+                            chunkList[entry.Id] = entry;
+                        }
+                        else
+                        {
+                            chunkList.Add(entry.Id, entry);
+                        }
+                    }
                 }
             }
 
@@ -2226,113 +2321,138 @@ namespace FrostySdk.Managers
                 }
                 else
                 {
+                    WriteToLog("Writing to cache (Superbundles)");
+
                     writer.Write(superBundles.Count);
-                    foreach (SuperBundleEntry sbentry in superBundles)
-                        writer.WriteNullTerminatedString(sbentry.Name);
+                    for (int i = 0; i < superBundles.Count; i++)
+                    {
+                        writer.WriteNullTerminatedString(superBundles[i].Name);
+                        WriteToLog(string.Format("progress:{0}", (double)i / (double)superBundles.Count * 100.0));
+                    }
                 }
+
+                WriteToLog("Writing to cache (Bundles)");
 
                 writer.Write(bundles.Count);
-                foreach (BundleEntry bentry in bundles)
+                for (int i = 0; i < bundles.Count; i++)
                 {
-                    writer.WriteNullTerminatedString(bentry.Name);
-                    writer.Write(bentry.SuperBundleId);
+                    writer.WriteNullTerminatedString(bundles[i].Name);
+                    writer.Write(bundles[i].SuperBundleId);
+
+                    WriteToLog(string.Format("progress:{0}", (double)i / (double)bundles.Count * 100.0));
                 }
+
+                WriteToLog("Writing to cache (EBX)");
 
                 writer.Write(ebxList.Values.Count);
-                foreach (EbxAssetEntry entry in ebxList.Values)
+                for (int i = 0; i < ebxList.Count; i++)
                 {
-                    writer.WriteNullTerminatedString(entry.Name);
-                    writer.Write(entry.Sha1);
-                    writer.Write(entry.Size);
-                    writer.Write(entry.OriginalSize);
-                    writer.Write((int)entry.Location);
-                    writer.Write(entry.IsInline);
+                    EbxAssetEntry ebx = ebxList.Values.ElementAt(i);
 
-                    writer.WriteNullTerminatedString(entry.Type ?? "");
-                    writer.Write(entry.Guid);
-
-                    writer.Write(entry.ExtraData != null);
-                    if (entry.ExtraData != null)
+                    writer.WriteNullTerminatedString(ebx.Name);
+                    writer.Write(ebx.Sha1);
+                    writer.Write(ebx.Size);
+                    writer.Write(ebx.OriginalSize);
+                    writer.Write((int)ebx.Location);
+                    writer.Write(ebx.IsInline);
+                    writer.WriteNullTerminatedString(ebx.Type ?? "");
+                    writer.Write(ebx.Guid);
+                    writer.Write(ebx.ExtraData != null);
+                    if (ebx.ExtraData != null)
                     {
-                        writer.Write(entry.ExtraData.BaseSha1);
-                        writer.Write(entry.ExtraData.DeltaSha1);
-                        writer.Write(entry.ExtraData.DataOffset);
-                        writer.Write(entry.ExtraData.SuperBundleId);
-                        writer.Write(entry.ExtraData.IsPatch);
-                        writer.WriteNullTerminatedString(entry.ExtraData.CasPath);
+                        writer.Write(ebx.ExtraData.BaseSha1);
+                        writer.Write(ebx.ExtraData.DeltaSha1);
+                        writer.Write(ebx.ExtraData.DataOffset);
+                        writer.Write(ebx.ExtraData.SuperBundleId);
+                        writer.Write(ebx.ExtraData.IsPatch);
+                        writer.WriteNullTerminatedString(ebx.ExtraData.CasPath);
+                    }
+                    writer.Write(ebx.Bundles.Count);
+                    foreach (int baseBundleId in ebx.Bundles)
+                    {
+                        writer.Write(baseBundleId);
+                    }
+                    writer.Write(ebx.DependentAssets.Count);
+                    foreach (Guid dependencyGuid in ebx.EnumerateDependencies())
+                    {
+                        writer.Write(dependencyGuid);
                     }
 
-                    writer.Write(entry.Bundles.Count);
-                    foreach (int bentry in entry.Bundles)
-                        writer.Write(bentry);
-
-                    writer.Write(entry.DependentAssets.Count);
-                    foreach (Guid guid in entry.EnumerateDependencies())
-                        writer.Write(guid);
+                    WriteToLog(string.Format("progress:{0}", (double)i / (double)ebxList.Count * 100.0));
                 }
+
+                WriteToLog("Writing to cache (RES)");
 
                 writer.Write(resList.Values.Count);
-                foreach (ResAssetEntry entry in resList.Values)
+                for (int i = 0; i < resList.Count; i++)
                 {
-                    writer.WriteNullTerminatedString(entry.Name);
-                    writer.Write(entry.Sha1);
-                    writer.Write(entry.Size);
-                    writer.Write(entry.OriginalSize);
-                    writer.Write((int)entry.Location);
-                    writer.Write(entry.IsInline);
+                    ResAssetEntry res = resList.Values.ElementAt(i);
 
-                    writer.Write(entry.ResRid);
-                    writer.Write(entry.ResType);
-                    writer.Write(entry.ResMeta.Length);
-                    writer.Write(entry.ResMeta);
-
-                    writer.Write(entry.ExtraData != null);
-                    if (entry.ExtraData != null)
+                    writer.WriteNullTerminatedString(res.Name);
+                    writer.Write(res.Sha1);
+                    writer.Write(res.Size);
+                    writer.Write(res.OriginalSize);
+                    writer.Write((int)res.Location);
+                    writer.Write(res.IsInline);
+                    writer.Write(res.ResRid);
+                    writer.Write(res.ResType);
+                    writer.Write(res.ResMeta.Length);
+                    writer.Write(res.ResMeta);
+                    writer.Write(res.ExtraData != null);
+                    if (res.ExtraData != null)
                     {
-                        writer.Write(entry.ExtraData.BaseSha1);
-                        writer.Write(entry.ExtraData.DeltaSha1);
-                        writer.Write(entry.ExtraData.DataOffset);
-                        writer.Write(entry.ExtraData.SuperBundleId);
-                        writer.Write(entry.ExtraData.IsPatch);
-                        writer.WriteNullTerminatedString(entry.ExtraData.CasPath);
+                        writer.Write(res.ExtraData.BaseSha1);
+                        writer.Write(res.ExtraData.DeltaSha1);
+                        writer.Write(res.ExtraData.DataOffset);
+                        writer.Write(res.ExtraData.SuperBundleId);
+                        writer.Write(res.ExtraData.IsPatch);
+                        writer.WriteNullTerminatedString(res.ExtraData.CasPath);
+                    }
+                    writer.Write(res.Bundles.Count);
+                    foreach (int baseBundleId in res.Bundles)
+                    {
+                        writer.Write(baseBundleId);
                     }
 
-                    writer.Write(entry.Bundles.Count);
-                    foreach (int bentry in entry.Bundles)
-                        writer.Write(bentry);
+                    WriteToLog(string.Format("progress:{0}", (double)i / (double)resList.Count * 100.0));
                 }
 
+                WriteToLog("Writing to cache (CHUNK)");
+
                 writer.Write(chunkList.Count);
-                foreach (ChunkAssetEntry entry in chunkList.Values)
+                for (int i = 0; i < chunkList.Count; i++)
                 {
-                    writer.Write(entry.Id);
-                    writer.Write(entry.Sha1);
-                    writer.Write(entry.Size);
-                    writer.Write((int)entry.Location);
-                    writer.Write(entry.IsInline);
+                    ChunkAssetEntry chunk = chunkList.Values.ElementAt(i);
 
-                    writer.Write(entry.BundledSize);
-                    writer.Write(entry.RangeStart);
-                    writer.Write(entry.RangeEnd);
-                    writer.Write(entry.LogicalOffset);
-                    writer.Write(entry.LogicalSize);
-                    writer.Write(entry.H32);
-                    writer.Write(entry.FirstMip);
-
-                    writer.Write(entry.ExtraData != null);
-                    if (entry.ExtraData != null)
+                    writer.Write(chunk.Id);
+                    writer.Write(chunk.Sha1);
+                    writer.Write(chunk.Size);
+                    writer.Write((int)chunk.Location);
+                    writer.Write(chunk.IsInline);
+                    writer.Write(chunk.BundledSize);
+                    writer.Write(chunk.RangeStart);
+                    writer.Write(chunk.RangeEnd);
+                    writer.Write(chunk.LogicalOffset);
+                    writer.Write(chunk.LogicalSize);
+                    writer.Write(chunk.H32);
+                    writer.Write(chunk.FirstMip);
+                    writer.Write(chunk.ExtraData != null);
+                    if (chunk.ExtraData != null)
                     {
-                        writer.Write(entry.ExtraData.BaseSha1);
-                        writer.Write(entry.ExtraData.DeltaSha1);
-                        writer.Write(entry.ExtraData.DataOffset);
-                        writer.Write(entry.ExtraData.SuperBundleId);
-                        writer.Write(entry.ExtraData.IsPatch);
-                        writer.WriteNullTerminatedString(entry.ExtraData.CasPath);
+                        writer.Write(chunk.ExtraData.BaseSha1);
+                        writer.Write(chunk.ExtraData.DeltaSha1);
+                        writer.Write(chunk.ExtraData.DataOffset);
+                        writer.Write(chunk.ExtraData.SuperBundleId);
+                        writer.Write(chunk.ExtraData.IsPatch);
+                        writer.WriteNullTerminatedString(chunk.ExtraData.CasPath);
+                    }
+                    writer.Write(chunk.Bundles.Count);
+                    foreach (int baseBundleId in chunk.Bundles)
+                    {
+                        writer.Write(baseBundleId);
                     }
 
-                    writer.Write(entry.Bundles.Count);
-                    foreach (int bentry in entry.Bundles)
-                        writer.Write(bentry);
+                    WriteToLog(string.Format("progress:{0}", (double)i / (double)chunkList.Count * 100.0));
                 }
             }
         }

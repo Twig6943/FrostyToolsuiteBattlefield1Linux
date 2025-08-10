@@ -2,7 +2,7 @@
   <PropertyGroup>
     <Configurations>Developer - Debug;Release - Alpha;Release - Beta;Release - Final</Configurations>
     <Platforms>x64</Platforms>
-    <TargetFrameworks>net48</TargetFrameworks>
+    <TargetFrameworks>net481</TargetFrameworks>
     <AssemblyTitle>BiowareLocalizationPlugin</AssemblyTitle>
     <Product>BiowareLocalizationPlugin</Product>
     <Copyright>Copyright ©  2020</Copyright>
@@ -38,6 +38,7 @@
   
   <Target Name="PostBuild" AfterTargets="PostBuildEvent">
     <Exec Command="xcopy /Y $(TargetPath) $(SolutionDir)$(OutDir)Plugins\" />
+	<Exec Command="xcopy /Y $(TargetPath) $(SolutionDir)..\FrostyModManager\$(OutDir)Plugins\" />
   </Target>
   
   <ItemGroup>
@@ -53,5 +54,9 @@
     <ProjectReference Include="..\..\FrostySdk\FrostySdk.csproj">
       <Private>false</Private>
     </ProjectReference>
+	<ProjectReference Include="..\..\FrostyModSupport\FrostyModSupport.csproj">
+      <Private>false</Private>
+    </ProjectReference>
+	<Reference Include="Microsoft.CSharp" />
   </ItemGroup>
 </Project>

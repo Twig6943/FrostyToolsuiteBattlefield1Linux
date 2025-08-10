@@ -9,7 +9,6 @@ using Frosty.Controls;
 using System.IO;
 using System.Globalization;
 using FrostySdk;
-using FrostySdk.Interfaces;
 using Microsoft.Win32;
 using FrostySdk.IO;
 using Frosty.ModSupport;
@@ -29,6 +28,8 @@ using Frosty.Core.Controls;
 using System.IO.Compression;
 using System.Linq;
 using Newtonsoft.Json;
+using System.Threading.Tasks;
+using System.Media;
 
 namespace FrostyModManager
 {
@@ -209,12 +210,64 @@ namespace FrostyModManager
         public ModPrimaryActionType PrimaryAction;
         public ModSecondaryActionType SecondaryAction;
         public string Name;
+        public string NiceName;
     }
 
     public class ModResourceInfo
     {
         public string Name { get; }
         public string Type { get; }
+
+        public string ModName
+        {
+            get
+            {
+                return mods.LastOrDefault()?.NiceName ?? string.Empty;
+            }
+        }
+
+        public string Status
+        {
+            get
+            {
+                var mod = mods.LastOrDefault();
+
+                if (mod == null)
+                {
+                    return string.Empty;
+                }
+
+                var sb = new StringBuilder();
+
+                switch (mod.PrimaryAction)
+                {
+                    case ModPrimaryActionType.Add:
+                        sb.Append("Add");
+                        break;
+                    case ModPrimaryActionType.Merge:
+                        sb.Append("Merge");
+                        break;
+                    case ModPrimaryActionType.Modify:
+                        sb.Append("Modify");
+                        break;
+                }
+
+                if (mod.SecondaryAction == ModSecondaryActionType.AddToBundle)
+                {
+                    sb.Append(", Bundle");
+                }
+
+                return sb.ToString();
+            }
+        }
+
+        public string Conflicts
+        {
+            get
+            {
+                return mods.Count > 1 ? "Yes" : "No";
+            }
+        }
 
         public IEnumerable<ModAction> Mods => mods;
         public int ModCount => mods.Count;
@@ -231,7 +284,7 @@ namespace FrostyModManager
             nameHash = Fnv1.HashString(t + "/" + n);
         }
 
-        public void AddMod(string m, ModPrimaryActionType primaryAction, IEnumerable<int> modAddBundles)
+        public void AddMod(FrostyMod mod, ModPrimaryActionType primaryAction, IEnumerable<int> modAddBundles)
         {
             bool isAdded = false;
             if (modAddBundles != null)
@@ -244,7 +297,14 @@ namespace FrostyModManager
                 }
             }
 
-            mods.Add(new ModAction() { Name = m, PrimaryAction = primaryAction, SecondaryAction = (isAdded) ? ModSecondaryActionType.AddToBundle : ModSecondaryActionType.None });
+            mods.Add(
+                new ModAction()
+                {
+                    Name = mod.Filename,
+                    NiceName = mod.ModDetails.Title,
+                    PrimaryAction = primaryAction,
+                    SecondaryAction = (isAdded) ? ModSecondaryActionType.AddToBundle : ModSecondaryActionType.None
+                });
             if (FirstModToModifyIndex == -1)
             {
                 if (primaryAction != ModPrimaryActionType.None)
@@ -259,7 +319,13 @@ namespace FrostyModManager
                 int hash = Fnv1.HashString(s);
                 return hash == nameHash;
             }
+
             return base.Equals(obj);
+        }
+
+        public override int GetHashCode()
+        {
+            return base.GetHashCode();
         }
     }
 
@@ -281,16 +347,59 @@ namespace FrostyModManager
         private List<FrostyPack> packs = new List<FrostyPack>();
         private FrostyPack selectedPack;
         private FileSystem fs;
+        private DirectoryInfo modsDir = new DirectoryInfo(Path.Combine("Mods", ProfilesLibrary.ProfileName));
 
         private static int manifestVersion = 1;
+
+        private Progress<string> DropProgress;
+
+        private IProgress<string> DropProgressReporter => DropProgress;
+
+        private Progress<bool> UpdateConflictsProgress;
+        private IProgress<bool> UpdateConflictsProgressReporter => UpdateConflictsProgress;
+
+        private List<ModResourceInfo> ConflictInfos = new List<ModResourceInfo>();
+        private int ConflictPage = 0;
+        private const int ConflictPageSize = 34;
 
         public MainWindow()
         {
             InitializeComponent();
+            FileLogger.Init();
+
             TaskbarItemInfo = new System.Windows.Shell.TaskbarItemInfo();
 
             tabContent.HeaderControl = tabControl;
             availableModsTabContent.HeaderControl = availableModsTabControl;
+
+            DropProgress = new Progress<string>();
+
+            DropProgress.ProgressChanged += (s, arg) =>
+            {
+                if (string.IsNullOrWhiteSpace(arg))
+                {
+                    return;
+                }
+
+                FrostyWindow_Drop(arg);
+            };
+
+            AllowDrop = true;
+
+            UpdateConflictsProgress = new Progress<bool>();
+
+            UpdateConflictsProgress.ProgressChanged += (s, arg) =>
+            {
+                UpdateConflicts(arg);
+            };
+
+            showOnlyReplacementsCheckBox.IsChecked = true;
+
+            if (OperatingSystemHelper.IsWine())
+            {
+                launchButton.Visibility = Visibility.Collapsed;
+                launchButton.IsEnabled = false;
+            }
         }
 
         private void FrostyWindow_FrostyLoaded(object sender, EventArgs e)
@@ -298,16 +407,6 @@ namespace FrostyModManager
             (App.Logger as FrostyLogger).AddBinding(tb, TextBox.TextProperty);
 
             string gamePath = Config.Get<string>("GamePath", "", ConfigScope.Game);
-            //string gamePath = Config.Get<string>("Init", "GamePath", "");
-            //string gameProfileName = Config.Get<string>("Init", "Profile", "");
-
-            //if (!ProfilesLibrary.Initialize(gameProfileName))
-            //{
-            //    FrostyMessageBox.Show("There was an error when trying to load game using specified profile.", "Frosty Mod Manager");
-            //    Closing -= FrostyWindow_Closing;
-            //    Close();
-            //    return;
-            //}
 
             if (!ProfilesLibrary.EnableExecution)
             {
@@ -318,27 +417,45 @@ namespace FrostyModManager
             }
 
             fs = new FileSystem(gamePath);
-            //fs = new FileSystem(Config.Get<string>("Init", "GamePath", ""));
+
             foreach (FileSystemSource source in ProfilesLibrary.Sources)
+            {
                 fs.AddSource(source.Path, source.SubDirs);
+            }
+
             fs.Initialize();
 
             Config.Save();
-            //Config.Save(App.configFilename);
-            Title = "Frosty Mod Manager - " + App.Version + " (" + ProfilesLibrary.DisplayName + ")";
+
+            Title = "Frosty Mod Manager - " + App.Version + " (" + ProfilesLibrary.DisplayName + ") ";
+            Title += OperatingSystemHelper.IsWine() ? "Linux" : "Windows";
 
             TypeLibrary.Initialize();
             App.PluginManager.Initialize();
 
-            FrostyTaskWindow.Show("Loading Mods", "", (task) =>
-            {
-                DirectoryInfo di = new DirectoryInfo("Mods/" + ProfilesLibrary.ProfileName);
-                if (!di.Exists)
-                    Directory.CreateDirectory(di.FullName);
+            LoadMenuExtensions();
 
+            if (Directory.Exists(Config.Get<string>("CustomModsDirectory", "")))
+            {
+                modsDir = new DirectoryInfo(Path.Combine(Config.Get<string>("CustomModsDirectory", ""), ProfilesLibrary.ProfileName));
+            }
+            else
+            {
+                App.Logger.Log("Custom Mods Directory does not exist, using default instead");
+            }
+
+            FrostyTaskWindow.Show("Loading Mods", "", (logger) =>
+            {
+                if (!modsDir.Exists)
+                {
+                    Directory.CreateDirectory(modsDir.FullName);
+                }
+
+                int currentMod = 0;
+                int totalMods = modsDir.EnumerateFiles().Count();
 
                 // load mods
-                foreach (FileInfo fi in di.EnumerateFiles())
+                Parallel.ForEach(modsDir.EnumerateFiles(), fi =>
                 {
                     if (fi.Extension == ".fbmod")
                     {
@@ -367,16 +484,19 @@ namespace FrostyModManager
                             File.Delete(fi.FullName.Replace(".fbmod", "_01.archive"));
                         }
                     }
-                }
+                    logger.LogProgress(currentMod++ / (float)totalMods * 100d);
+                });
                 // load collections
-                foreach (FileInfo fi in di.EnumerateFiles())
+                Parallel.ForEach(modsDir.EnumerateFiles(), fi =>
                 {
                     if (fi.Extension == ".fbcollection")
                     {
                         AddCollection(fi.FullName, 0);
                     }
-                }
+                    logger.LogProgress(currentMod++ / (float)totalMods * 100d);
+                });
             });
+            availableMods = availableMods.OrderBy(o => o.Filename).ToList();
             availableModsList.ItemsSource = availableMods;
 
             CollectionView view = (CollectionView)CollectionViewSource.GetDefaultView(availableModsList.ItemsSource);
@@ -461,7 +581,28 @@ namespace FrostyModManager
             {
             }
 
-            LoadedPluginsList.ItemsSource = App.PluginManager.LoadedPlugins;
+            LoadedPluginsList.ItemsSource = App.PluginManager.Plugins;
+
+            if (Config.Get("ApplyModOrder", "List") == "List")
+            {
+                orderComboBox.SelectedIndex = 0;
+            }
+            else if (Config.Get("ApplyModOrder", "List") == "Priority")
+            {
+                orderComboBox.SelectedIndex = 1;
+            }
+
+            if (Config.Get("FlatpakMessage", OperatingSystemHelper.IsWine()))
+            {
+                Config.Add("FlatpakMessage", false);
+
+                var message = "If Frosty is run through Flatpak application (Bottles, Lutris, Heroic), then make sure to select 'All user files' in Flatseal for that application.";
+                message += "\r\n\r\nOtherwise Frosty Mod Manager might crash.";
+
+                FrostyMessageBox.Show(message, "Frosty Mod Manager");
+            }
+
+            GC.Collect();
         }
 
         private void addProfileButton_Click(object sender, RoutedEventArgs e)
@@ -514,6 +655,74 @@ namespace FrostyModManager
             }
         }
 
+        private void packRename_Click(object sender, RoutedEventArgs e)
+        {
+            AddProfileWindow win = new AddProfileWindow("Rename Pack");
+            win.ShowDialog();
+
+            if (win.DialogResult == true)
+            {
+                string newPackName = win.ProfileName;
+                var oldPack = selectedPack;
+
+                FrostyPack existingPack = packs.Find((FrostyPack a) => {
+                    return a.Name.CompareTo(newPackName) == 0;
+                });
+
+                if (existingPack == null)
+                {
+                    FrostyPack newPack = new FrostyPack(newPackName);
+                    foreach (var mod in oldPack.AppliedMods)
+                    {
+                        newPack.AppliedMods.Add(mod);
+                    }
+
+                    Config.Add(newPackName, ConfigScope.Pack);
+                    Config.Remove(oldPack.Name, ConfigScope.Pack);
+
+                    packs.Add(newPack);
+                    packs.Remove(oldPack);
+
+                    packsComboBox.Items.Refresh();
+                    packsComboBox.SelectedItem = newPack;
+                }
+                else FrostyMessageBox.Show("A pack with the same name already exists", "Frosty Mod Manager");
+            }
+        }
+
+        private void packDuplicate_Click(object sender, RoutedEventArgs e)
+        {
+            AddProfileWindow win = new AddProfileWindow("Duplicate Pack");
+            win.ShowDialog();
+
+            if (win.DialogResult == true)
+            {
+                string newPackName = win.ProfileName;
+                var oldPack = selectedPack;
+
+                FrostyPack existingPack = packs.Find((FrostyPack a) => {
+                    return a.Name.CompareTo(newPackName) == 0;
+                });
+
+                if (existingPack == null)
+                {
+                    Config.Add(newPackName, ConfigScope.Pack);
+
+                    FrostyPack newPack = new FrostyPack(newPackName);
+                    foreach (var mod in oldPack.AppliedMods)
+                    {
+                        newPack.AppliedMods.Add(mod);
+                    }
+
+                    packs.Add(newPack);
+
+                    packsComboBox.Items.Refresh();
+                    packsComboBox.SelectedItem = newPack;
+                }
+                else FrostyMessageBox.Show("A pack with the same name already exists", "Frosty Mod Manager");
+            }
+        }
+
         private void removeButton_Click(object sender, RoutedEventArgs e)
         {
             int selectedIndex = appliedModsList.SelectedIndex;
@@ -529,12 +738,30 @@ namespace FrostyModManager
 
         private void upButton_Click(object sender, RoutedEventArgs e)
         {
-            for (int i = 0; i < (Keyboard.IsKeyDown(Key.LeftShift) ? 4 : 1); i++)
-                selectedPack.MoveModsUp(appliedModsList.SelectedItems);
+            if (orderComboBox.SelectedIndex == 0)
+            {
+                for (int i = 0; i < (Keyboard.IsKeyDown(Key.LeftShift) ? 4 : 1); i++)
+                {
+                    selectedPack.MoveModsUp(appliedModsList.SelectedItems);
+                }
 
-            if (Keyboard.IsKeyDown(Key.LeftShift) && Keyboard.IsKeyDown(Key.LeftCtrl))
-                selectedPack.MoveModsTop(appliedModsList.SelectedItems);
+                if (Keyboard.IsKeyDown(Key.LeftShift) && Keyboard.IsKeyDown(Key.LeftCtrl))
+                {
+                    selectedPack.MoveModsTop(appliedModsList.SelectedItems);
+                }
+            }
+            else if (orderComboBox.SelectedIndex == 1)
+            {
+                for (int i = 0; i < (Keyboard.IsKeyDown(Key.LeftShift) ? 4 : 1); i++)
+                {
+                    selectedPack.MoveModsDown(appliedModsList.SelectedItems);
+                }
 
+                if (Keyboard.IsKeyDown(Key.LeftShift) && Keyboard.IsKeyDown(Key.LeftCtrl))
+                {
+                    selectedPack.MoveModsBottom(appliedModsList.SelectedItems);
+                }
+            }
             appliedModsList.Items.Refresh();
 
             updateAppliedModButtons();
@@ -542,15 +769,203 @@ namespace FrostyModManager
 
         private void downButton_Click(object sender, RoutedEventArgs e)
         {
-            for (int i = 0; i < (Keyboard.IsKeyDown(Key.LeftShift) ? 4 : 1); i++)
-                selectedPack.MoveModsDown(appliedModsList.SelectedItems);
+            if (orderComboBox.SelectedIndex == 0)
+            {
+                for (int i = 0; i < (Keyboard.IsKeyDown(Key.LeftShift) ? 4 : 1); i++)
+                {
+                    selectedPack.MoveModsDown(appliedModsList.SelectedItems);
+                }
 
-            if (Keyboard.IsKeyDown(Key.LeftShift) && Keyboard.IsKeyDown(Key.LeftCtrl))
-                selectedPack.MoveModsBottom(appliedModsList.SelectedItems);
+                if (Keyboard.IsKeyDown(Key.LeftShift) && Keyboard.IsKeyDown(Key.LeftCtrl))
+                {
+                    selectedPack.MoveModsBottom(appliedModsList.SelectedItems);
+                }
+            }
+            else if (orderComboBox.SelectedIndex == 1)
+            {
+                for (int i = 0; i < (Keyboard.IsKeyDown(Key.LeftShift) ? 4 : 1); i++)
+                {
+                    selectedPack.MoveModsUp(appliedModsList.SelectedItems);
+                }
 
+                if (Keyboard.IsKeyDown(Key.LeftShift) && Keyboard.IsKeyDown(Key.LeftCtrl))
+                {
+                    selectedPack.MoveModsTop(appliedModsList.SelectedItems);
+                }
+            }
             appliedModsList.Items.Refresh();
 
             updateAppliedModButtons();
+        }
+
+        private void installButton_Click(object sender, RoutedEventArgs e)
+        {
+            Config.Save();
+
+            // initialize
+            Frosty.Core.App.FileSystem = new FileSystem(Config.Get<string>("GamePath", "", ConfigScope.Game));
+            //FileSystem fs = new FileSystem(Config.Get<string>("Init", "GamePath", ""));
+            foreach (FileSystemSource source in ProfilesLibrary.Sources)
+                Frosty.Core.App.FileSystem.AddSource(source.Path, source.SubDirs);
+            Frosty.Core.App.FileSystem.Initialize();
+
+            // Set selected pack
+            App.SelectedPack = selectedPack.Name;
+
+            // get all applied mods
+            List<string> modPaths = new List<string>();
+            foreach (FrostyAppliedMod mod in selectedPack.AppliedMods)
+            {
+                if (mod.IsFound && mod.IsEnabled)
+                    modPaths.Add(mod.Mod.Filename);
+            }
+
+            // combine stored args with launch args
+            string additionalArgs = Config.Get<string>("CommandLineArgs", "", ConfigScope.Game) + " ";
+            //string additionalArgs = Config.Get<string>("Init", "AdditionalArgs", "") + " ";
+            additionalArgs += App.LaunchArgs;
+
+            // setup ability to cancel the process
+            CancellationTokenSource cancelToken = new CancellationTokenSource();
+
+            try
+            {
+                Clipboard.SetDataObject(string.Empty);
+            }
+            catch
+            {
+
+            }
+
+            if (selectedPack.Name.ContainsWhiteSpace())
+            {
+                FrostyMessageBox.Show($"Launching game with a profile name '{selectedPack.Name}' will fail. This name contains white space, like spacebars or enters.\r\n", "Mods installation failed");
+
+                return;
+            }
+
+            // launch
+            int retCode = -6;
+            FrostyTaskWindow.Show("Installing mods", "", (logger) =>
+            {
+                try
+                {
+                    foreach (var executionAction in App.PluginManager.ExecutionActions)
+                    {
+                        try
+                        {
+                            executionAction.PreLaunchAction(logger, PluginManagerType.InstallOnly, cancelToken.Token);
+                        }
+                        catch (Exception ex)
+                        {
+                            FileLogger.Info($"Exception on pre-launch action '{executionAction.GetType()}'.");
+
+                            throw ex;
+                        }
+                    }
+
+                    FrostyModExecutor modExecutor = new FrostyModExecutor();
+                    retCode = modExecutor.Install(fs, cancelToken.Token, logger, modsDir.FullName, App.SelectedPack, modPaths.ToArray());
+
+                    foreach (var executionAction in App.PluginManager.ExecutionActions)
+                    {
+                        executionAction.PostLaunchAction(logger, PluginManagerType.InstallOnly, cancelToken.Token);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    retCode = -1;
+
+                    foreach (var executionAction in App.PluginManager.ExecutionActions)
+                    {
+                        executionAction.PostLaunchAction(logger, PluginManagerType.InstallOnly, cancelToken.Token);
+                    }
+
+                    // process was cancelled
+                    App.Logger.Log("Launch Cancelled");
+                }
+
+            }, showCancelButton: true, cancelCallback: (logger) => cancelToken.Cancel());
+
+            if (retCode == 0)
+            {
+                var arguments = Config.Get<bool>("EASetup", false) ? "-dataPath EAMods" : $"-dataPath \"ModData/{App.SelectedPack}\"";
+
+                if (!string.IsNullOrWhiteSpace(additionalArgs))
+                {
+                    arguments += $" {additionalArgs}";
+                }
+
+                var clipBoardArgs = arguments;
+
+                StringBuilder sb = new StringBuilder();
+
+                if (OperatingSystemHelper.IsWine() && !Config.Get<bool>("EASetup", false))
+                {
+                    var linuxArguments = $"WINEDLLOVERRIDES=\"winmm=n,b\" %command% {arguments}";
+
+                    clipBoardArgs = linuxArguments;
+
+                    sb.Append("To launch the game with mods use this Launch Options in Steam:\r\n\r\n");
+                    sb.Append(linuxArguments);                    
+                }
+                else
+                {
+                    sb.Append("To launch the game with mods add these arguments in Steam or EA App to Launch Options:\r\n\r\n");
+                    sb.Append(arguments);
+                }
+
+                var clipboardSuccess = true;
+
+                for (int i = 0; i < 4; i++)
+                {
+                    clipboardSuccess = true;
+
+                    try
+                    {
+                        Clipboard.SetDataObject(clipBoardArgs);
+                        
+                        clipboardSuccess = true;
+                        i = 99;
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        FileLogger.Info($"Exception on clipboard set. Details: {ex}");
+                        clipboardSuccess = false;
+                    }
+                }
+
+                if (clipboardSuccess)
+                {
+                    sb.Append("\r\n\r\nLaunch Options were copied to clipboard.");
+                }
+                else
+                {
+                    sb.Append("\r\n\r\nError happened while coping options to clipboard. Try to install mods again or write them manually.");
+                }
+
+                if (!SymLinkHelper.AreSymLinksSupported)
+                {
+                    sb.Append("\r\n\r\nWarning:\r\nFrosty could not initialize Symbolic Links, so Hard Links were used for mod installation. Please report this for me to improve Symbolic Links implementation.");
+                }
+
+                FrostyMessageBox.Show(sb.ToString(), "Mods installed successfully");
+            }
+            else if (retCode == -2)
+            {
+                FrostyMessageBox.Show("Both Hard Link and Symbolic Link methods are unavailable on your system. Please report this issue.\r\nYou will need to manually remove ModData folder from game directory. Your game files might be damaged.\r\n", "Mods installation failed");
+            }
+            else if (retCode == -3)
+            {
+                FrostyMessageBox.Show("Frosty Mod Manager is missing access to read and write from game directory.\r\n", "Missing access");
+            }
+            else if (retCode != -1)
+            {
+                FrostyMessageBox.Show("Mods installation failed due to unknown error.\r\n", "Mods installation failed");
+            }
+
+            GC.Collect();
         }
 
         private void launchButton_Click(object sender, RoutedEventArgs e)
@@ -586,28 +1001,31 @@ namespace FrostyModManager
 
             // launch
             int retCode = 0;
-            FrostyTaskWindow.Show("Launching", "", (task) =>
+            FrostyTaskWindow.Show("Launching", "", (logger) =>
             {
                 try
                 {
                     foreach (var executionAction in App.PluginManager.ExecutionActions)
-                        executionAction.PreLaunchAction(task.TaskLogger, PluginManagerType.ModManager, cancelToken.Token);
+                        executionAction.PreLaunchAction(logger, PluginManagerType.ModManager, cancelToken.Token);
 
                     FrostyModExecutor modExecutor = new FrostyModExecutor();
-                    retCode = modExecutor.Run(fs, cancelToken.Token, task.TaskLogger, $"Mods/{ProfilesLibrary.ProfileName}/", App.SelectedPack, additionalArgs.Trim(), modPaths.ToArray());
+                    retCode = modExecutor.Run(fs, cancelToken.Token, logger, modsDir.FullName, App.SelectedPack, additionalArgs.Trim(), modPaths.ToArray());
 
                     foreach (var executionAction in App.PluginManager.ExecutionActions)
-                        executionAction.PostLaunchAction(task.TaskLogger, PluginManagerType.ModManager, cancelToken.Token);
+                        executionAction.PostLaunchAction(logger, PluginManagerType.ModManager, cancelToken.Token);
                 }
                 catch (OperationCanceledException)
                 {
                     retCode = -1;
 
                     foreach (var executionAction in App.PluginManager.ExecutionActions)
-                        executionAction.PostLaunchAction(task.TaskLogger, PluginManagerType.ModManager, cancelToken.Token);
+                        executionAction.PostLaunchAction(logger, PluginManagerType.ModManager, cancelToken.Token);
+
+                    // process was cancelled
+                    App.Logger.Log("Launch Cancelled");
                 }
 
-            }, showCancelButton: true, cancelCallback: (task) => cancelToken.Cancel());
+            }, showCancelButton: true, cancelCallback: (logger) => cancelToken.Cancel());
 
             if (retCode != -1)
                 WindowState = WindowState.Minimized;
@@ -615,6 +1033,8 @@ namespace FrostyModManager
             // kill the application if launched from the command line
             if (App.LaunchGameImmediately)
                 Close();
+
+            GC.Collect();
         }
 
         private void FrostyWindow_Closing(object sender, CancelEventArgs e)
@@ -683,6 +1103,19 @@ namespace FrostyModManager
                 if (idx != -1)
                     selectedPack.AppliedMods.RemoveAt(idx);
 
+                if (mod is FrostyMod && !((FrostyMod)mod).NewFormat)
+                {
+                    var fiNameWithoutExtension = fi.Name.Substring(0, fi.Name.Length - fi.Extension.Length).ToLower();
+
+                    var modFiles = Directory.GetFiles(modsDir.FullName).Select(x => new FileInfo(x)).ToList();
+                    var archives = modFiles.Where(x => x.Name.ToLower().StartsWith(fiNameWithoutExtension) && x.Extension.ToLower() == ".archive").ToList();
+
+                    foreach (var archive in archives)
+                    {
+                        File.Delete(archive.FullName);
+                    }
+                }
+
                 if (!fi.Exists)
                     continue;
 
@@ -721,7 +1154,7 @@ namespace FrostyModManager
                     if (modObj == null)
                         return -1;
 
-                    if (modObj.GetValue<string>("gameProfile") != ProfilesLibrary.ProfileName)
+                    if (modObj.GetValue<string>("gameProfile").ToLower() != ProfilesLibrary.ProfileName.ToLower())
                         return -2;
 
                     if (modObj.GetValue<int>("gameVersion") != fs.Head)
@@ -760,8 +1193,14 @@ namespace FrostyModManager
             }
 
             if (mod.GameVersion != fs.Head)
+            {
                 mod.AddWarning("Mod was designed for a different game version");
-            availableMods.Add(mod);
+            }
+
+            lock (availableMods)
+            {
+                availableMods.Add(mod);
+            }
 
             return mod;
         }
@@ -779,14 +1218,19 @@ namespace FrostyModManager
                 return null;
             }
 
-            foreach (var mod in collection.Mods)
+            foreach (FrostyMod mod in collection.Mods)
             {
-                int index = availableMods.FindIndex((IFrostyMod a) => a.Filename == mod.Filename);
-                if (index != -1)
-                    availableMods.RemoveAt(index);
+                lock (availableMods)
+                {
+                    int index = availableMods.FindIndex((IFrostyMod a) => a.Filename == mod.Filename);
+                    if (index != -1)
+                    {
+                        availableMods.RemoveAt(index);
+                    }
+                }
             }
 
-            availableMods.Add(collection);
+            lock (availableMods) availableMods.Add(collection);
 
             return collection;
         }
@@ -838,16 +1282,73 @@ namespace FrostyModManager
             imagePanel.Visibility = Visibility.Collapsed;
         }
 
-        private void FrostyWindow_Drop(object sender, DragEventArgs e)
+        protected override void OnDragEnter(DragEventArgs e)
         {
-            if (e.Data.GetDataPresent(DataFormats.FileDrop, true) == true)
-            {
-                string[] filenames = (string[])e.Data.GetData(DataFormats.FileDrop, true);
-                InstallMods(filenames);
+            base.OnDragEnter(e);
 
-                ICollectionView view = CollectionViewSource.GetDefaultView(availableModsList.ItemsSource);
-                view.Refresh();
+            FileLogger.Info($"Default drag and drop effect: {e.Effects}");
+
+            e.Effects = DragDropEffects.Copy;
+        }
+
+        protected override void OnDrop(DragEventArgs e)
+        {
+            base.OnDrop(e);
+
+            if (e.Data.GetDataPresent(DataFormats.FileDrop, true))
+            {
+                var dataObj = e.Data.GetData(DataFormats.FileDrop, true);
+
+                if (dataObj == null)
+                {
+                    FileLogger.Info("Drop data is null.");
+                    return;
+                }
+
+                var filenames = (string[])dataObj;
+
+                if (filenames.Length <= 0)
+                {
+                    FileLogger.Info("Drop data is empty.");
+                    return;
+                }
+
+                foreach (var filename in filenames)
+                {
+                    FileLogger.Info($"Drop file received '{filename}'.");
+                }
+
+                var report = string.Join("?", filenames);
+
+                DropProgressReporter.Report(report);
             }
+            else if (e.Data.GetFormats().Any(f => f == "FileContents"))
+            {
+                FileLogger.Info("Cannot import mod files that have not been extracted.");
+
+                if (OperatingSystemHelper.IsWine())
+                {
+                    return;
+                }
+
+                SystemSounds.Hand.Play();
+
+                FrostyMessageBox.Show("Cannot import mod files that have not been extracted", "Frosty Mod Manager");
+            }
+        }
+
+        private void FrostyWindow_Drop(string joinedFileNames)
+        {
+            FileLogger.Info("Adding mods from drag and drop.");
+
+            var fileNames = joinedFileNames.Split('?');
+
+            InstallMods(fileNames);
+
+            ICollectionView view = CollectionViewSource.GetDefaultView(availableModsList.ItemsSource);
+            view.Refresh();
+
+            FileLogger.Info("Drag and drop mods added.");
         }
 
         private void InstallMods(string[] filenames)
@@ -857,103 +1358,123 @@ namespace FrostyModManager
 
             PackManifest packManifest = null;
 
-            FrostyTaskWindow.Show("Installing Mods", "", (task) =>
+            FrostyTaskWindow.Show("Installing Mods", "", (logger) =>
             {
+                List<string> collections = new List<string>();
+
                 foreach (string filename in filenames)
                 {
                     FileInfo fi = new FileInfo(filename);
-                    task.Update(fi.Name);
+                    logger.Log(fi.Name);
 
                     try
                     {
-                        if (IsCompressed(fi))
+                        FileLogger.Info($"Loading mod '{filename}.'");
+
+                        if (IsCompressed(fi.Name))
                         {
+                            FileLogger.Info("Mod is compressed.");
+
                             List<string> mods = new List<string>();
-                            List<string> collections = new List<string>();
                             List<int> format = new List<int>();
                             List<string> archives = new List<string>();
                             int fbpacks = 0;
 
                             // create decompressor
                             IDecompressor decompressor = null;
-                            if (fi.Extension == ".rar") decompressor = new RarDecompressor();
-                            else if (fi.Extension == ".zip" || fi.Extension == ".fbpack") decompressor = new ZipDecompressor();
-                            else if (fi.Extension == ".7z") decompressor = new SevenZipDecompressor();
+                            var extension = fi.Extension.ToLower();
+                            if (extension == ".rar") decompressor = new RarDecompressor();
+                            else if (extension == ".zip" || extension == ".fbpack") decompressor = new ZipDecompressor();
+                            else if (extension == ".7z") decompressor = new SevenZipDecompressor();
 
-                            // search out fbmods in archive
-                            decompressor.OpenArchive(filename);
-                            foreach (CompressedFileInfo compressedFi in decompressor.EnumerateFiles())
+                            try
                             {
-
-                                if (compressedFi.Extension == ".fbpack")
+                                // search out fbmods in archive
+                                if (!decompressor.OpenArchive(filename))
                                 {
-                                    //create temp file
-                                    DirectoryInfo tempdir = new DirectoryInfo($"temp/");
-                                    FileInfo tempfile = new FileInfo(tempdir + compressedFi.Filename);
-
-                                    tempdir.Create();
-                                    decompressor.DecompressToFile(tempfile.FullName);
-
-                                    //install temp file
-                                    Dispatcher.Invoke(() => {
-                                        InstallMods(new string[] { tempfile.FullName });
-                                    });
-
-                                    //delete temp files
-                                    if (tempfile.Exists) tempfile.Delete();
-                                    if (tempdir.Exists) tempdir.Delete();
-
-                                    fbpacks++;
+                                    errors.Add(new ImportErrorInfo() { filename = fi.Name, error = "Archive is invalid." });
+                                    continue;
                                 }
-                                else if (compressedFi.Extension == ".fbcollection")
-                                {
-                                    collections.Add(compressedFi.Filename);
-                                }
-                                else if (compressedFi.Extension == ".fbmod")
-                                {
-                                    string modFilename = compressedFi.Filename;
-                                    byte[] buffer = decompressor.DecompressToMemory();
 
-                                    using (MemoryStream ms = new MemoryStream(buffer))
+                                foreach (CompressedFileInfo compressedFi in decompressor.EnumerateFiles())
+                                {
+                                    if (compressedFi.Extension.ToLower() == ".fbpack")
                                     {
-                                        int retCode = VerifyMod(ms);
-                                        if (retCode >= 0)
+                                        //create temp file
+                                        DirectoryInfo tempdir = new DirectoryInfo($"temp/");
+                                        FileInfo tempfile = new FileInfo(tempdir + compressedFi.Filename);
+
+                                        tempdir.Create();
+                                        decompressor.DecompressToFile(compressedFi, tempfile.FullName);
+
+                                        //install temp file
+                                        Dispatcher.Invoke(() =>
                                         {
-                                            if ((retCode & 1) != 0)
+                                            InstallMods(new string[] { tempfile.FullName });
+                                        });
+
+                                        //delete temp files
+                                        if (tempfile.Exists) tempfile.Delete();
+                                        if (tempdir.Exists) tempdir.Delete();
+
+                                        fbpacks++;
+                                    }
+                                    else if (compressedFi.Extension.ToLower() == ".fbcollection")
+                                    {
+                                        collections.Add(compressedFi.Filename);
+                                    }
+                                    else if (compressedFi.Extension.ToLower() == ".fbmod")
+                                    {
+                                        string modFilename = compressedFi.Filename;
+                                        byte[] buffer = decompressor.DecompressToMemory(compressedFi);
+
+                                        using (MemoryStream ms = new MemoryStream(buffer))
+                                        {
+                                            int retCode = VerifyMod(ms);
+                                            if (retCode >= 0)
                                             {
-                                                // continue with import (warning)
-                                                errors.Add(new ImportErrorInfo() { filename = modFilename, error = "Mod was designed for a different game version, it may or may not work.", isWarning = true });
-                                            }
+                                                if ((retCode & 1) != 0)
+                                                {
+                                                    // continue with import (warning)
+                                                    errors.Add(new ImportErrorInfo() { filename = modFilename, error = "Mod was designed for a different game version, it may or may not work.", isWarning = true });
+                                                }
 
-                                            // add mod
-                                            mods.Add(compressedFi.Filename);
-                                            format.Add((retCode & 0x8000) != 0 ? 1 : 0);
-                                        }
-                                        // ignore RetCode -1 here
-                                        else if (retCode == -2)
-                                        {
-                                            errors.Add(new ImportErrorInfo() { filename = modFilename, error = "Mod was not designed for this game." });
+                                                // add mod
+                                                mods.Add(compressedFi.Filename);
+                                                format.Add((retCode & 0x8000) != 0 ? 1 : 0);
+                                            }
+                                            // ignore RetCode -1 here
+                                            else if (retCode == -2)
+                                            {
+                                                errors.Add(new ImportErrorInfo() { filename = modFilename, error = "Mod was not designed for this game." });
+                                            }
                                         }
                                     }
-                                }
-                                else if (compressedFi.Extension == ".archive")
-                                {
-                                    archives.Add(compressedFi.Filename);
-                                }
-                                else if (compressedFi.Filename == "manifest.json")
-                                {
-                                    using (StreamReader reader = new StreamReader(compressedFi.Stream))
+                                    else if (compressedFi.Extension.ToLower() == ".archive")
                                     {
-                                        packManifest = JsonConvert.DeserializeObject<PackManifest>(reader.ReadToEnd());
+                                        archives.Add(compressedFi.Filename);
+                                    }
+                                    else if (compressedFi.Filename.ToLower() == "manifest.json")
+                                    {
+                                        using (StreamReader reader = new StreamReader(compressedFi.Stream))
+                                        {
+                                            packManifest = JsonConvert.DeserializeObject<PackManifest>(reader.ReadToEnd());
+                                        }
                                     }
                                 }
+
+                                decompressor.CloseArchive();
                             }
-                            decompressor.CloseArchive();
+                            catch
+                            {
+                                FileLogger.Info($"Failed to read archive of '{fi.FullName}'.");
+                                errors.Add(new ImportErrorInfo() { filename = fi.Name, error = "Failed to read Archive." });
+                            }
 
                             if (mods.Count == 0 && fbpacks == 0)
                             {
                                 // no point continuing with this archive
-                                errors.Add(new ImportErrorInfo() { filename = fi.Name, error = "Archive contains no installable mods." });
+                                errors.Add(new ImportErrorInfo() { filename = fi.Name, error = "Archive contains no installable mods.", isWarning = true });
                                 continue;
                             }
 
@@ -978,9 +1499,10 @@ namespace FrostyModManager
                                 if (existingMod != null)
                                 {
                                     availableMods.Remove(existingMod);
-                                    DirectoryInfo di = new DirectoryInfo("Mods/" + ProfilesLibrary.ProfileName + "/");
-                                    foreach (FileInfo archiveFi in di.GetFiles(mod.Replace(".fbmod", "") + "*.archive"))
+                                    foreach (FileInfo archiveFi in modsDir.GetFiles(mod.Replace(".fbmod", "") + "*.archive"))
+                                    {
                                         File.Delete(archiveFi.FullName);
+                                    }
                                 }
                             }
 
@@ -1003,40 +1525,22 @@ namespace FrostyModManager
                                 {
                                     if (mods.Contains(compressedFi.Filename) || archives.Contains(compressedFi.Filename))
                                     {
-                                        decompressor.DecompressToFile("Mods/" + ProfilesLibrary.ProfileName + "/" + compressedFi.Filename);
+                                        decompressor.DecompressToFile(compressedFi, Path.Combine(modsDir.FullName, compressedFi.Filename));
                                     }
                                 }
 
                                 // and add them to the mod manager
                                 for (int i = 0; i < mods.Count; i++)
                                 {
-                                    fi = new FileInfo("Mods/" + ProfilesLibrary.ProfileName + "/" + mods[i]);
+                                    fi = new FileInfo(Path.Combine(modsDir.FullName, mods[i]));
                                     lastInstalledMod = AddMod(fi.FullName, format[i]);
-                                }
-                            }
-
-                            if (collections.Count > 0)
-                            {
-                                // now actually decompress files
-                                decompressor.OpenArchive(filename);
-                                foreach (CompressedFileInfo compressedFi in decompressor.EnumerateFiles())
-                                {
-                                    if (collections.Contains(compressedFi.Filename))
-                                    {
-                                        decompressor.DecompressToFile("Mods/" + ProfilesLibrary.ProfileName + "/" + compressedFi.Filename);
-                                    }
-                                }
-
-                                // and add them to the mod manager
-                                for (int i = 0; i < collections.Count; i++)
-                                {
-                                    fi = new FileInfo("Mods/" + ProfilesLibrary.ProfileName + "/" + collections[i]);
-                                    lastInstalledMod = AddCollection(fi.FullName, 0);
                                 }
                             }
                         }
                         else if (fi.Extension == ".daimod")
                         {
+                            FileLogger.Info("Mod is DAI mod.");
+
                             // special handling for DAI mod files
                             using (NativeReader reader = new NativeReader(new FileStream(fi.FullName, FileMode.Open)))
                             {
@@ -1081,7 +1585,7 @@ namespace FrostyModManager
                                 string newDesc = "(Converted from .daimod)\r\n\r\n" + elem["description"].InnerText + "\r\n\r\n" + configValues;
 
                                 DbObject modObject = new DbObject();
-                                modObject.AddValue("magic", "FBMODV2");
+                                modObject.AddValue("magic", "FBMODV3");
                                 modObject.AddValue("gameProfile", ProfilesLibrary.ProfileName);
                                 modObject.AddValue("gameVersion", 0);
 
@@ -1158,9 +1662,13 @@ namespace FrostyModManager
                                         resource.AddValue("rangeEnd", uint.Parse(subElem.GetAttribute("rangeEnd")));
                                         resource.AddValue("logicalOffset", uint.Parse(subElem.GetAttribute("logicalOffset")));
                                         resource.AddValue("logicalSize", uint.Parse(subElem.GetAttribute("logicalSize")));
+                                        resource.AddValue("h32", int.Parse(subElem.GetAttribute("chunkH32")));
 
-                                        if (subElem.GetAttribute("meta") != "00")
-                                            resource.SetValue("firstMip", 3);
+                                        string meta = subElem.GetAttribute("meta");
+                                        if (meta != "00")
+                                        {
+                                            resource.SetValue("firstMip", int.Parse(meta.Substring(20, 8), NumberStyles.HexNumber));
+                                        }
 
                                         // add special chunks bundle
                                         DbObject action = new DbObject();
@@ -1195,9 +1703,11 @@ namespace FrostyModManager
                                 modObject.AddValue("resources", resourcesList);
                                 modObject.AddValue("actions", actionsList);
 
-                                using (DbWriter writer = new DbWriter(new FileStream("Mods/" + ProfilesLibrary.ProfileName + "/" + fi.Name.Replace(".daimod", ".fbmod"), FileMode.Create)))
+                                using (DbWriter writer = new DbWriter(new FileStream(Path.Combine(modsDir.FullName, fi.Name.Replace(".daimod", ".fbmod")), FileMode.Create)))
+                                {
                                     writer.Write(modObject);
-                                using (NativeWriter writer = new NativeWriter(new FileStream("Mods/" + ProfilesLibrary.ProfileName + "/" + fi.Name.Replace(".daimod", "_01.archive"), FileMode.Create)))
+                                }
+                                using (NativeWriter writer = new NativeWriter(new FileStream(Path.Combine(modsDir.FullName, fi.Name.Replace(".daimod", "_01.archive")), FileMode.Create)))
                                 {
                                     for (int i = 0; i < resources.Count; i++)
                                     {
@@ -1206,44 +1716,61 @@ namespace FrostyModManager
                                     }
                                 }
 
-                                fi = new FileInfo("Mods/" + ProfilesLibrary.ProfileName + "/" + fi.Name.Replace(".daimod", ".fbmod"));
+                                fi = new FileInfo(Path.Combine(modsDir.FullName, fi.Name.Replace(".daimod", ".fbmod")));
                                 lastInstalledMod = AddMod(fi.FullName, 0);
                             }
+                        }
+                        else if (fi.Extension == ".fbcollection")
+                        {
+                            FileLogger.Info("Mod is fbcolletion.");
+
+                            collections.Add(fi.Name);
                         }
                         else
                         {
                             // dont allow any files without fbmod extension
-                            if (fi.Extension != ".fbmod")
+                            if (fi.Extension.ToLower() != ".fbmod")
                             {
-                                if (fi.Extension == ".archive")
+                                if (fi.Extension.ToLower() == ".archive")
                                     continue;
+
+                                FileLogger.Info("Mod is not fbmod.");
+
 
                                 errors.Add(new ImportErrorInfo() { filename = fi.Name, error = "File is not a valid Frosty Mod." });
                                 continue;
                             }
 
+                            FileLogger.Info("Mod is fbmod.");
+
                             // make sure mod is designed for current profile
                             bool newFormat = false;
                             using (FileStream stream = new FileStream(fi.FullName, FileMode.Open, FileAccess.Read))
                             {
+                                FileLogger.Info("Verifying fbmod.");
+
                                 int retCode = VerifyMod(stream);
                                 if ((retCode & 1) != 0)
                                 {
                                     // continue with import (warning)
+                                    FileLogger.Info("Mod was designed for a different game version, it may or may not work.");
                                     errors.Add(new ImportErrorInfo { filename = fi.Name, error = "Mod was designed for a different game version, it may or may not work.", isWarning = true });
                                 }
                                 else if (retCode == -1)
                                 {
+                                    FileLogger.Info("File is not a valid Frosty Mod.");
                                     errors.Add(new ImportErrorInfo { filename = fi.Name, error = "File is not a valid Frosty Mod." });
                                 }
                                 else if (retCode == -2)
                                 {
+                                    FileLogger.Info("Mod was not designed for this game.");
                                     errors.Add(new ImportErrorInfo { filename = fi.Name, error = "Mod was not designed for this game." });
                                     continue;
                                 }
                                 else if (retCode == -3)
                                 {
-                                    errors.Add(new ImportErrorInfo { filename = fi.Name, error = "Mod was found to be invalid and cannot be used" });
+                                    FileLogger.Info("Mod was found to be invalid and cannot be used.");
+                                    errors.Add(new ImportErrorInfo { filename = fi.Name, error = "Mod was found to be invalid and cannot be used." });
                                     continue;
                                 }
 
@@ -1253,42 +1780,112 @@ namespace FrostyModManager
 
                             if (!newFormat)
                             {
-                                // make sure mod has archive file
-                                if (!File.Exists(fi.FullName.Replace(".fbmod", "_01.archive")))
+                                FileLogger.Info("Validate old format archive file.");
+
+                                var archivePath = ArchiveHelper.GetArchivePath(fi.FullName, out var errorMessage);
+
+                                if (string.IsNullOrWhiteSpace(archivePath))
                                 {
-                                    errors.Add(new ImportErrorInfo { filename = fi.Name, error = "Mod is missing the archive component." });
+                                    FileLogger.Info($"Could not get archive path for mod '{fi.FullName}'. Details: {errorMessage}");
+                                    errors.Add(new ImportErrorInfo { filename = fi.Name, error = $"Could not get archive path. Details: {errorMessage}" });
+                                    continue;
+                                }
+
+                                // make sure mod has archive file
+                                if (!File.Exists(archivePath))
+                                {
+                                    FileLogger.Info($"Missing archive file at '{archivePath}'.");
+                                    errors.Add(new ImportErrorInfo { filename = fi.Name, error = $"Mod is missing the archive component at '{archivePath}'." });
                                     continue;
                                 }
                             }
 
                             // check for existing mod of same name
+                            FileLogger.Info("Check if mod with same name already exists.");
+                            FrostyMod existingMod = availableMods.Find((IFrostyMod a) => a.Filename.ToLower().CompareTo(fi.Name.ToLower()) == 0) as FrostyMod;
+                            if (existingMod != null)
                             {
-                                FrostyMod existingMod = availableMods.Find((IFrostyMod a) => a.Filename.ToLower().CompareTo(fi.Name.ToLower()) == 0) as FrostyMod;
-                                if (existingMod != null)
+                                availableMods.Remove(existingMod);
+                                foreach (FileInfo archiveFi in modsDir.GetFiles(fi.Name.ToLower().Replace(".fbmod", string.Empty) + "_*.archive"))
                                 {
-                                    availableMods.Remove(existingMod);
-                                    DirectoryInfo di = new DirectoryInfo("Mods/" + ProfilesLibrary.ProfileName + "/");
-                                    foreach (FileInfo archiveFi in di.GetFiles(fi.Name.Replace(".fbmod", "") + "_*.archive"))
-                                        File.Delete(archiveFi.FullName);
-                                    File.Delete(di.FullName + "/" + fi.Name);
+                                    File.Delete(archiveFi.FullName);
                                 }
+                                File.Delete(modsDir.FullName + "/" + fi.Name);
                             }
 
                             // copy mod over
-                            File.Copy(fi.FullName, "Mods/" + ProfilesLibrary.ProfileName + "/" + fi.Name);
-                            foreach (FileInfo archiveFi in fi.Directory.GetFiles(fi.Name.Replace(".fbmod", "") + "_*.archive"))
-                                File.Copy(archiveFi.FullName, "Mods/" + ProfilesLibrary.ProfileName + "/" + archiveFi.Name);
+                            FileLogger.Info($"Copy mod to mods dir '{modsDir.FullName}'.");
+                            File.Copy(fi.FullName, Path.Combine(modsDir.FullName, fi.Name));
+                            foreach (FileInfo archiveFi in fi.Directory.GetFiles(fi.Name.ToLower().Replace(".fbmod", string.Empty) + "_*.archive"))
+                            {
+                                File.Copy(archiveFi.FullName, Path.Combine(modsDir.FullName, archiveFi.Name));
+                            }
 
                             // add mod to manager
-                            fi = new FileInfo("Mods/" + ProfilesLibrary.ProfileName + "/" + fi.Name);
+                            FileLogger.Info("Add mod to manager.");
+                            fi = new FileInfo(Path.Combine(modsDir.FullName, fi.Name));
                             lastInstalledMod = AddMod(fi.FullName, newFormat ? 1 : 0);
+                        }
+
+                        if (collections.Count > 0)
+                        {
+                            FileLogger.Info("Finishing collections.");
+
+                            if (filename.ToLower().Contains(".zip"))
+                            {
+                                FileLogger.Info($"Decompressing zip collection '{filename}'.");
+
+                                // now actually decompress files
+                                ZipDecompressor decompressor = new ZipDecompressor();
+                                decompressor.OpenArchive(filename);
+
+                                var compressedFiles = decompressor.EnumerateFiles().ToList();
+
+                                FileLogger.Info($"Zip has {compressedFiles.Count} files.");
+
+                                foreach (CompressedFileInfo compressedFi in compressedFiles)
+                                {
+                                    FileLogger.Info($"Decompresssing file '{compressedFi.Filename}' from zip.");
+
+                                    if (collections.Contains(compressedFi.Filename))
+                                    {
+                                        try
+                                        {
+                                            decompressor.DecompressToFile(compressedFi, Path.Combine(modsDir.FullName, compressedFi.Filename));
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            FileLogger.Info($"Exception while decompressing zip collection file '{compressedFi.Filename}'. Details: {ex}");
+                                            errors.Add(new ImportErrorInfo { error = ex.Message, filename = compressedFi.Filename });
+                                        }
+                                    }
+                                }
+                            }
+                            else if (filename.ToLower().Contains(".fbcollection"))
+                            {
+                                FileLogger.Info($"Collection '{filename}' is a fbcollection.");
+                                File.Copy(fi.FullName, Path.Combine(modsDir.FullName, fi.Name));
+                            }
                         }
                     }
                     catch (FrostyModLoadException e)
                     {
+                        FileLogger.Info($"Exception while loading mod '{fi.Name}'. Details: {e}");
                         errors.Add(new ImportErrorInfo { error = e.Message, filename = fi.Name });
                         File.Delete(fi.FullName);
                     }
+                    catch (Exception ex)
+                    {
+                        FileLogger.Info($"Exception while installing mod '{fi.Name}'. Details: {ex}");
+                        errors.Add(new ImportErrorInfo { error = ex.Message, filename = fi.Name });
+                    }
+                }
+
+                // add collections to the mod manager
+                for (int i = 0; i < collections.Count; i++)
+                {
+                    FileInfo fi = new FileInfo(Path.Combine(modsDir.FullName, collections[i]));
+                    lastInstalledMod = AddCollection(fi.FullName, 0);
                 }
             });
 
@@ -1339,7 +1936,36 @@ namespace FrostyModManager
             }
         }
 
-        private bool IsCompressed(FileInfo fi) => fi.Extension == ".rar" || fi.Extension == ".zip" || fi.Extension == ".7z" || fi.Extension == ".fbpack";
+        private bool IsCompressed(string path)
+        {
+            var extension = Path.GetExtension(path).ToLower();
+
+            if (extension == ".rar")
+            {
+                FileLogger.Info("File is rar.");
+                return true;
+            }
+
+            if (extension == ".zip")
+            {
+                FileLogger.Info("File is zip.");
+                return true;
+            }
+
+            if (extension == ".7z")
+            {
+                FileLogger.Info("File is zip.");
+                return true;
+            }
+
+            if (extension == ".fbpack")
+            {
+                FileLogger.Info("File is fbpack.");
+                return true;
+            }
+
+            return false;
+        }
 
         private void launchOptionsMenuItem_Click(object sender, RoutedEventArgs e)
         {
@@ -1352,6 +1978,13 @@ namespace FrostyModManager
             AboutWindow win = new AboutWindow();
             win.ShowDialog();
         }
+
+        private void modDataMenuItem_Click(object sender, RoutedEventArgs e)
+        {
+            ManageModDataWindow win = new ManageModDataWindow();
+            win.ShowDialog();
+        }
+
         private void appliedModsList_SelectionChanged(object sender, SelectionChangedEventArgs e) => updateAppliedModButtons();
 
         private void updateAppliedModButtons()
@@ -1359,8 +1992,17 @@ namespace FrostyModManager
             if (appliedModsList.SelectedItem != null)
             {
                 removeButton.IsEnabled = true;
-                upButton.IsEnabled = appliedModsList.SelectedIndex != 0;
-                downButton.IsEnabled = appliedModsList.SelectedIndex != (appliedModsList.Items.Count - 1);
+
+                if (orderComboBox.SelectedIndex == 0)
+                {
+                    upButton.IsEnabled = appliedModsList.SelectedIndex != 0;
+                    downButton.IsEnabled = appliedModsList.SelectedIndex != (appliedModsList.Items.Count - 1);
+                }
+                else if (orderComboBox.SelectedIndex == 1)
+                {
+                    upButton.IsEnabled = appliedModsList.SelectedIndex != (appliedModsList.Items.Count - 1);
+                    downButton.IsEnabled = appliedModsList.SelectedIndex != 0;
+                }
             }
             else
             {
@@ -1420,182 +2062,125 @@ namespace FrostyModManager
         private void SelectedProfile_AppliedModsUpdated(object sender, RoutedEventArgs e)
         {
             if (tabControl.SelectedItem == conflictsTabItem)
-                UpdateConflicts();
+            {
+                UpdateConflictsProgressReporter.Report(false);
+            }
 
             conflictsTabItem.Visibility = Visibility.Visible;
         }
 
-        private void UpdateConflicts()
+        private void UpdateConflicts(bool reset)
         {
+            if (reset)
+            {
+                ConflictInfos.Clear();
+                SetConflictPage(0);
+
+                return;
+            }
+
+            if (tabControl.SelectedItem != conflictsTabItem)
+            {
+                return;
+            }
+
+            FileLogger.Info("Start conflicts update.");
+
             bool onlyShowReplacements = (bool)showOnlyReplacementsCheckBox.IsChecked;
 
             StringBuilder sb = new StringBuilder();
             List<ModResourceInfo> totalResourceList = new List<ModResourceInfo>();
 
-            CancellationTokenSource cancelToken = new CancellationTokenSource();
+            //SetNativeEnabled(this, false);
+            IsEnabled = false;
 
-            bool cancelled = false;
-            FrostyTaskWindow.Show("Updating Actions", "", (task) => {
-                try
-                {
-                    // Iterate through mod resources
-                    for (int i = 0; i < selectedPack.AppliedMods.Count; i++)
-                    {
-                        FrostyAppliedMod appliedMod = selectedPack.AppliedMods[i];
-                        if (!appliedMod.IsFound || !appliedMod.IsEnabled)
-                            continue;
+            var modal = FrostyTaskWindow.ShowSimple("Updating Actions", "");
 
-
-                        FrostyMod[] mods;
-                        if (appliedMod.Mod is FrostyModCollection)
-                        {
-                            mods = (appliedMod.Mod as FrostyModCollection).Mods.ToArray();
-                        }
-                        else
-                        {
-                            mods = new FrostyMod[1];
-                            mods[0] = appliedMod.Mod as FrostyMod;
-                        }
-
-                        foreach (var mod in mods)
-                        {
-                            if (mod.NewFormat)
-                            {
-                                foreach (BaseModResource resource in mod.Resources)
-                                {
-                                    if (resource.Type == ModResourceType.Embedded)
-                                        continue;
-
-                                    string resType = resource.Type.ToString().ToLower();
-                                    string resourceName = resource.Name;
-
-                                    if (resource.UserData != "")
-                                    {
-                                        string[] arr = resource.UserData.Split(';');
-                                        resType = arr[0].ToLower();
-                                        resourceName = arr[1];
-                                    }
-
-                                    int index = totalResourceList.FindIndex((ModResourceInfo a) => a.Equals(resType + "/" + resourceName));
-
-                                    if (index == -1)
-                                    {
-                                        ModResourceInfo resInfo = new ModResourceInfo(resourceName, resType);
-                                        totalResourceList.Add(resInfo);
-                                        index = totalResourceList.Count - 1;
-                                    }
-
-                                    cancelToken.Token.ThrowIfCancellationRequested();
-
-                                    ModPrimaryActionType primaryAction = ModPrimaryActionType.None;
-                                    if (resource.HasHandler)
-                                    {
-                                        if ((uint)resource.Handler == 0xBD9BFB65)
-                                            primaryAction = ModPrimaryActionType.Merge;
-                                        else
-                                        {
-                                            ICustomActionHandler handler = null;
-                                            if (resource.Type == ModResourceType.Ebx)
-                                                handler = App.PluginManager.GetCustomHandler((uint)resource.Handler);
-                                            else if (resource.Type == ModResourceType.Res)
-                                                handler = App.PluginManager.GetCustomHandler((ResourceType)(resource as ResResource).ResType);
-
-                                            if (handler.Usage == HandlerUsage.Merge)
-                                            {
-                                                foreach (string actionString in handler.GetResourceActions(resource.Name, mod.GetResourceData(resource)))
-                                                {
-                                                    string[] arr = actionString.Split(';');
-                                                    AddResourceAction(totalResourceList, mod.Filename, arr[0], arr[1], (ModPrimaryActionType)Enum.Parse(typeof(ModPrimaryActionType), arr[2]));
-                                                }
-                                                primaryAction = ModPrimaryActionType.Merge;
-                                            }
-                                            else primaryAction = ModPrimaryActionType.Modify;
-                                        }
-                                    }
-                                    else if (resource.IsAdded) primaryAction = ModPrimaryActionType.Add;
-                                    else if (resource.IsModified) primaryAction = ModPrimaryActionType.Modify;
-
-                                    totalResourceList[index].AddMod(mod.Filename, primaryAction, resource.AddedBundles);
-                                }
-                            }
-                        }
-                    }
-
-                }
-                catch (OperationCanceledException)
-                {
-                    cancelled = true;
-                }
-
-                if (onlyShowReplacements)
-                    totalResourceList.RemoveAll(item => item.ModCount <= 1);
-            }, showCancelButton: true, cancelCallback: (task) => cancelToken.Cancel());
-
-            if (cancelled)
-            {
-                Dispatcher.BeginInvoke((Action)(() => tabControl.SelectedItem = appliedModsTabItem));
-                return;
-            }
-
-            List<GridViewColumn> columns = new List<GridViewColumn>
-            {
-                new GridViewColumn
-                {
-                    Header = "Resource",
-                    CellTemplate = conflictsListView.Resources["conflictsNameTemplate"] as DataTemplate
-                }
-            };
-
+            // Iterate through mod resources
             for (int i = 0; i < selectedPack.AppliedMods.Count; i++)
             {
                 FrostyAppliedMod appliedMod = selectedPack.AppliedMods[i];
                 if (!appliedMod.IsFound || !appliedMod.IsEnabled)
                     continue;
 
-                Binding primaryActionBinding = new Binding("") { Converter = new ModPrimaryActionConverter(), ConverterParameter = appliedMod.Mod.Filename };
-                Binding primaryTooltipBinding = new Binding("") { Converter = new ModPrimaryActionTooltipConverter(), ConverterParameter = appliedMod.Mod.Filename };
-                Binding secondaryActionBinding = new Binding("") { Converter = new ModSecondaryActionConverter(), ConverterParameter = appliedMod.Mod.Filename };
-                Binding secondaryTooltipBinding = new Binding("") { Converter = new ModSecondaryActionTooltipConverter(), ConverterParameter = appliedMod.Mod.Filename };
 
-                GridViewColumn gvc = new GridViewColumn() { Header = appliedMod.Mod.ModDetails.Title, HeaderTemplate = conflictsListView.Resources["conflictsModHeaderTemplate"] as DataTemplate };
-                DataTemplate dt = new DataTemplate(typeof(Grid));
+                FrostyMod[] mods;
+                if (appliedMod.Mod is FrostyModCollection)
+                {
+                    mods = (appliedMod.Mod as FrostyModCollection).Mods.ToArray();
+                }
+                else
+                {
+                    mods = new FrostyMod[1];
+                    mods[0] = appliedMod.Mod as FrostyMod;
+                }
 
-                FrameworkElementFactory factory = new FrameworkElementFactory(typeof(StackPanel));
-                factory.SetValue(StackPanel.OrientationProperty, Orientation.Horizontal);
-                factory.SetValue(StackPanel.HorizontalAlignmentProperty, HorizontalAlignment.Center);
-                factory.SetValue(Grid.HeightProperty, 22.0d);
+                foreach (var mod in mods)
+                {
+                    if (mod.NewFormat)
+                    {
+                        foreach (BaseModResource resource in mod.Resources)
+                        {
+                            if (resource.Type == ModResourceType.Embedded)
+                                continue;
 
-                FrameworkElementFactory img = new FrameworkElementFactory(typeof(Image));
-                img.SetBinding(Image.SourceProperty, primaryActionBinding);
-                img.SetValue(Image.HeightProperty, 18.0d);
-                img.SetValue(Image.HorizontalAlignmentProperty, HorizontalAlignment.Center);
-                img.SetValue(Image.VerticalAlignmentProperty, VerticalAlignment.Center);
-                img.SetValue(Image.OpacityProperty, 0.75d);
-                img.SetValue(Image.ToolTipProperty, primaryTooltipBinding);
+                            string resType = resource.Type.ToString().ToLower();
+                            string resourceName = resource.Name;
 
-                FrameworkElementFactory simg = new FrameworkElementFactory(typeof(Image));
-                simg.SetBinding(Image.SourceProperty, secondaryActionBinding);
-                simg.SetValue(Image.HeightProperty, 18.0d);
-                simg.SetValue(Image.HorizontalAlignmentProperty, HorizontalAlignment.Center);
-                simg.SetValue(Image.VerticalAlignmentProperty, VerticalAlignment.Center);
-                simg.SetValue(Image.OpacityProperty, 0.75d);
-                simg.SetValue(Image.ToolTipProperty, secondaryTooltipBinding);
+                            if (resource.UserData != "")
+                            {
+                                string[] arr = resource.UserData.Split(';');
+                                resType = arr[0].ToLower();
+                                resourceName = arr[1];
+                            }
 
-                factory.AppendChild(img);
-                factory.AppendChild(simg);
+                            int index = totalResourceList.FindIndex((ModResourceInfo a) => a.Equals(resType + "/" + resourceName));
 
-                dt.VisualTree = factory;
-                gvc.CellTemplate = dt;
-                gvc.Width = 150;
+                            if (index == -1)
+                            {
+                                ModResourceInfo resInfo = new ModResourceInfo(resourceName, resType);
+                                totalResourceList.Add(resInfo);
+                                index = totalResourceList.Count - 1;
+                            }
 
-                columns.Add(gvc);
+                            ModPrimaryActionType primaryAction = ModPrimaryActionType.None;
+                            if (resource.HasHandler)
+                            {
+                                if ((uint)resource.Handler == 0xBD9BFB65)
+                                    primaryAction = ModPrimaryActionType.Merge;
+                                else
+                                {
+                                    ICustomActionHandler handler = null;
+                                    if (resource.Type == ModResourceType.Ebx)
+                                        handler = App.PluginManager.GetCustomHandler((uint)resource.Handler);
+                                    else if (resource.Type == ModResourceType.Res)
+                                        handler = App.PluginManager.GetCustomHandler((ResourceType)(resource as ResResource).ResType);
+
+                                    if (handler.Usage == HandlerUsage.Merge)
+                                    {
+                                        foreach (string actionString in handler.GetResourceActions(resource.Name, mod.GetResourceData(resource)))
+                                        {
+                                            string[] arr = actionString.Split(';');
+                                            AddResourceAction(totalResourceList, mod, arr[0], arr[1], (ModPrimaryActionType)Enum.Parse(typeof(ModPrimaryActionType), arr[2]));
+                                        }
+                                        primaryAction = ModPrimaryActionType.Merge;
+                                    }
+                                    else primaryAction = ModPrimaryActionType.Modify;
+                                }
+                            }
+                            else if (resource.IsAdded) primaryAction = ModPrimaryActionType.Add;
+                            else if (resource.IsModified) primaryAction = ModPrimaryActionType.Modify;
+
+                            totalResourceList[index].AddMod(mod, primaryAction, resource.AddedBundles);
+                        }
+                    }
+                }
             }
 
-            GridView gv = conflictsListView.View as GridView;
-
-            gv.Columns.Clear();
-            foreach (GridViewColumn gvc in columns)
-                gv.Columns.Add(gvc);
+            if (onlyShowReplacements)
+            {
+                totalResourceList.RemoveAll(item => item.ModCount <= 1);
+            }
 
             totalResourceList.Sort((ModResourceInfo a, ModResourceInfo b) =>
             {
@@ -1603,12 +2188,22 @@ namespace FrostyModManager
                 return result == 0 ? a.Name.CompareTo(b.Name) : result;
             });
 
-            Dispatcher.BeginInvoke((Action)(() => tabControl.SelectedItem = conflictsTabItem));
-            conflictsListView.ItemsSource = totalResourceList;
+            modal.Close();
+
+            //SetNativeEnabled(this, true);
+            IsEnabled = true;
+
+            tabControl.SelectedItem = conflictsTabItem;
+
+            ConflictInfos.Clear();
+            ConflictInfos.AddRange(totalResourceList);
+            SetConflictPage(0);
             conflictsListView.SelectedIndex = 0;
+
+            FileLogger.Info("Finished conflicts update.");
         }
 
-        private void AddResourceAction(List<ModResourceInfo> totalResourceList, string modName, string resourceName, string resourceType, ModPrimaryActionType type)
+        private void AddResourceAction(List<ModResourceInfo> totalResourceList, FrostyMod mod, string resourceName, string resourceType, ModPrimaryActionType type)
         {
             int index = totalResourceList.FindIndex((ModResourceInfo a) => a.Equals(resourceType + "/" + resourceName));
             if (index == -1)
@@ -1618,15 +2213,12 @@ namespace FrostyModManager
                 index = totalResourceList.Count - 1;
             }
 
-            totalResourceList[index].AddMod(modName, type, null);
+            totalResourceList[index].AddMod(mod, type, null);
         }
 
         private void tabControl_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
-            if (conflictsTabItem.IsSelected)
-            {
-                UpdateConflicts();
-            }
+            UpdateConflictsProgressReporter.Report(!conflictsTabItem.IsSelected);
         }
 
         private void launchConfigurationWindow_Click(object sender, RoutedEventArgs e)
@@ -1664,11 +2256,6 @@ namespace FrostyModManager
             availableModsList.Items.Filter = new Predicate<object>((object a) => ((IFrostyMod)a).ModDetails.Title.ToLower().Contains(availableModsFilterTextBox.Text.ToLower()));
         }
 
-        private void PART_ShowOnlyReplacementsCheckBox_Checked(object sender, RoutedEventArgs e)
-        {
-            UpdateConflicts();
-        }
-
         private void optionsMenuItem_Click(object sender, RoutedEventArgs e)
         {
             OptionsWindow win = new OptionsWindow();
@@ -1677,7 +2264,7 @@ namespace FrostyModManager
 
         private void ZipPack(string filename)
         {
-            FrostyTaskWindow.Show("Exporting Pack", "", (task) =>
+            FrostyTaskWindow.Show("Exporting Pack", "", (logger) =>
             {
                 try
                 {
@@ -1800,8 +2387,164 @@ namespace FrostyModManager
             }
         }
 
-        private void collectionModsList_LostFocus(object sender, RoutedEventArgs e) {
+        private void collectionModsList_LostFocus(object sender, RoutedEventArgs e)
+        {
             ((ListView)sender).UnselectAll();
+        }
+
+        private void orderComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            Setter setter = new Setter(DockPanel.DockProperty, Dock.Top);
+            switch (orderComboBox.SelectedIndex)
+            {
+                case 0:
+                    setter = new Setter(DockPanel.DockProperty, Dock.Top);
+                    Config.Add("ApplyModOrder", "List");
+                    break;
+                case 1:
+                    setter = new Setter(DockPanel.DockProperty, Dock.Bottom);
+                    Config.Add("ApplyModOrder", "Priority");
+                    break;
+            }
+            Style style = new Style(typeof(ListBoxItem), FindResource(typeof(ListBoxItem)) as Style);
+            style.Setters.Add(setter);
+            appliedModsList.ItemContainerStyle = style;
+
+            updateAppliedModButtons();
+        }
+
+        private void CopyFullExceptionMenuItem_Click(object sender, RoutedEventArgs e)
+        {
+            Plugin selectedPlugin = (Plugin)LoadedPluginsList.SelectedItem;
+
+            // retrieve the selected plugin's load exception, execute ToString on it, and add the result to the clipboard
+            Clipboard.SetText(string.Format("[{0}]\n{1}", new string[]
+            {
+                DateTime.Now.ToString(),
+                selectedPlugin.LoadException.ToString()
+            }));
+        }
+
+        private void LoadMenuExtensions()
+        {
+            // Add menu extensions to Mod Manager
+            foreach (var menuExtension in App.PluginManager.MenuExtensions)
+            {
+                MenuItem foundMenuItem = null;
+                foreach (MenuItem menuItem in menu.Items)
+                {
+                    // contains top level menu item already
+                    if (menuExtension.TopLevelMenuName.Equals(menuItem.Header as string, StringComparison.OrdinalIgnoreCase))
+                    {
+                        foundMenuItem = menuItem;
+                        break;
+                    }
+                }
+
+                if (foundMenuItem == null)
+                {
+                    foundMenuItem = new MenuItem() { Header = menuExtension.TopLevelMenuName };
+
+                    // insert the top-level Menu behind the Help Menu
+                    menu.Items.Insert(menu.Items.Count - 1, foundMenuItem);
+                }
+
+                if (!string.IsNullOrEmpty(menuExtension.SubLevelMenuName))
+                {
+                    MenuItem parentMenuItem = null;
+                    foreach (var menuItem in foundMenuItem.Items)
+                    {
+                        if (menuItem is MenuItem item)
+                        {
+                            if (menuExtension.SubLevelMenuName.Equals(item.Header as string, StringComparison.OrdinalIgnoreCase))
+                            {
+                                parentMenuItem = foundMenuItem;
+                                foundMenuItem = item;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (parentMenuItem == null)
+                    {
+                        parentMenuItem = foundMenuItem;
+                        foundMenuItem = new MenuItem { Header = menuExtension.SubLevelMenuName };
+                        parentMenuItem.Items.Add(foundMenuItem);
+                    }
+                }
+
+                MenuItem menuExtItem = new MenuItem
+                {
+                    Header = menuExtension.MenuItemName,
+                    Icon = new Image() { Source = menuExtension.Icon },
+                    Command = menuExtension.MenuItemClicked
+                };
+                foundMenuItem.Items.Add(menuExtItem);
+            }
+        }
+
+        private void ConflictsHandleDoubleClick(object sender, MouseButtonEventArgs e)
+        {
+            var obj = conflictsListView.SelectedItem;
+
+            if (obj == null)
+            {
+                return;
+            }
+
+            var modInfo = obj as ModResourceInfo;
+
+            var sb = new StringBuilder();
+
+            sb.Append($"List of mods altering resource\r\n'{modInfo.Name}'\r\n");
+
+            foreach (var mod in modInfo.Mods)
+            {
+                sb.Append($"\r\n • {mod.NiceName}"); 
+            }
+
+            FrostyMessageBox.Show(sb.ToString(), "Resource conflicts");
+        }
+
+        private void showOnlyReplacementsCheckBox_Click(object sender, RoutedEventArgs e)
+        {
+            UpdateConflictsProgressReporter.Report(false);
+        }
+
+        private void SetConflictPage(int page)
+        {
+            if (page < 0)
+            {
+                page = 0;
+            }
+
+            int maxPage = (ConflictInfos.Count / ConflictPageSize) - ((ConflictInfos.Count % ConflictPageSize == 0 && ConflictInfos.Count > 0) ? 1 : 0);
+
+            if (page > maxPage)
+            {
+                page = maxPage;
+            }
+
+            ConflictPage = page;
+            var items = ConflictInfos.Skip(ConflictPageSize * page).Take(ConflictPageSize).ToList();
+
+            conflictsPrev.IsEnabled = page > 0;
+            conflictsNext.IsEnabled = page < maxPage;
+            conflictsPageText.Text = $"  Page {page + 1}  ";
+
+            conflictsListView.ItemsSource = items;
+        }
+
+        private void conflictsPrev_Click(object sender, RoutedEventArgs e)
+        {
+            ConflictPage--;
+            SetConflictPage(ConflictPage);
+        }
+
+        private void conflictsNext_Click(object sender, RoutedEventArgs e)
+        {
+            ConflictPage++;
+            SetConflictPage(ConflictPage);
         }
     }
 }

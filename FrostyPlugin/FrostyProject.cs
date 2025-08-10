@@ -9,6 +9,7 @@ using FrostySdk.Resources;
 using Frosty.Core.Handlers;
 using Frosty.Core.Mod;
 using Frosty.Core.IO;
+using System.Threading;
 
 namespace Frosty.Core
 {
@@ -30,14 +31,11 @@ namespace Frosty.Core
             11 - Merging of defined res files (eg. ShaderBlockDepot)
             12 - Legacy files now use determinstic guids and added user data (retroactively fix old legacy files)
             13 - Merging of defined ebx files
-            14 - Can duplicate blueprint bundles
+            14 - H32 and FirstMip are now stored even if chunk was only added to bundles
         */
 
-#if FROSTY_DEVELOPER_ADDTOBUNDLE
         private const uint FormatVersion = 14;
-#else
-        private const uint FormatVersion = 13;
-#endif
+
         private const ulong Magic = 0x00005954534F5246;
 
         public string DisplayName
@@ -63,7 +61,7 @@ namespace Frosty.Core
         private string filename;
         private DateTime creationDate;
         private DateTime modifiedDate;
-        private uint gameVersion;
+        public uint gameVersion;
 
         // mod export settings
         private ModSettings modSettings;
@@ -287,6 +285,10 @@ namespace Frosty.Core
                         writer.Write(bCustomHandler);
                         writer.Write(buf.Length);
                         writer.Write(buf);
+
+
+                        if (updateDirtyState)
+                            entry.ModifiedEntry.IsDirty = false;
                     }
 
                     if (updateDirtyState)
@@ -341,6 +343,8 @@ namespace Frosty.Core
 
                         writer.Write(buffer.Length);
                         writer.Write(buffer);
+                        if (updateDirtyState)
+                            entry.ModifiedEntry.IsDirty = false;
                     }
 
                     if (updateDirtyState)
@@ -367,6 +371,9 @@ namespace Frosty.Core
                     foreach (int bid in entry.AddedBundles)
                         writer.WriteNullTerminatedString(App.AssetManager.GetBundleEntry(bid).Name);
 
+                    writer.Write(entry.HasModifiedData ? entry.ModifiedEntry.FirstMip : entry.FirstMip);
+                    writer.Write(entry.HasModifiedData ? entry.ModifiedEntry.H32 : entry.H32);
+
                     // if the asset has been modified
                     writer.Write(entry.HasModifiedData);
                     if (entry.HasModifiedData)
@@ -376,13 +383,13 @@ namespace Frosty.Core
                         writer.Write(entry.ModifiedEntry.LogicalSize);
                         writer.Write(entry.ModifiedEntry.RangeStart);
                         writer.Write(entry.ModifiedEntry.RangeEnd);
-                        writer.Write(entry.ModifiedEntry.FirstMip);
-                        writer.Write(entry.ModifiedEntry.H32);
                         writer.Write(entry.ModifiedEntry.AddToChunkBundle);
                         writer.WriteNullTerminatedString(entry.ModifiedEntry.UserData);
 
                         writer.Write(entry.ModifiedEntry.Data.Length);
                         writer.Write(entry.ModifiedEntry.Data);
+                        if (updateDirtyState)
+                            entry.ModifiedEntry.IsDirty = false;
                     }
 
                     if (updateDirtyState)
@@ -438,10 +445,12 @@ namespace Frosty.Core
             return modSettings;
         }
 
-        public void WriteToMod(string filename, ModSettings overrideSettings)
+        public void WriteToMod(string filename, ModSettings overrideSettings, bool editorLaunch, CancellationToken cancelToken)
         {
             using (FrostyModWriter writer = new FrostyModWriter(new FileStream(filename, FileMode.Create), overrideSettings))
-                writer.WriteProject(this);
+            {
+                writer.WriteProject(this, editorLaunch, cancelToken);
+            }
         }
 
         public static void SaveLinkedAssets(AssetEntry entry, NativeWriter writer)
@@ -865,10 +874,6 @@ namespace Frosty.Core
                     }
                 }
 
-                bool isModified = true;
-                if (version >= 13)
-                    isModified = reader.ReadBoolean();
-
                 Sha1 sha1 = Sha1.Zero;
                 uint logicalOffset = 0;
                 uint logicalSize = 0;
@@ -880,6 +885,16 @@ namespace Frosty.Core
                 string userData = "";
                 byte[] data = null;
 
+                if (version > 13)
+                {
+                    firstMip = reader.ReadInt();
+                    h32 = reader.ReadInt();
+                }
+
+                bool isModified = true;
+                if (version >= 13)
+                    isModified = reader.ReadBoolean();
+
                 if (isModified)
                 {
                     sha1 = reader.ReadSha1();
@@ -887,8 +902,13 @@ namespace Frosty.Core
                     logicalSize = reader.ReadUInt();
                     rangeStart = reader.ReadUInt();
                     rangeEnd = reader.ReadUInt();
-                    firstMip = reader.ReadInt();
-                    h32 = reader.ReadInt();
+
+                    if (version < 14)
+                    {
+                        firstMip = reader.ReadInt();
+                        h32 = reader.ReadInt();
+                    }
+
                     addToChunkBundles = reader.ReadBoolean();
                     if (version >= 12)
                         userData = reader.ReadNullTerminatedString();
@@ -953,6 +973,11 @@ namespace Frosty.Core
                         };
                         entry.OnModified();
                     }
+                    else
+                    {
+                        entry.H32 = h32;
+                        entry.FirstMip = firstMip;
+                    }
                 }
             }
 
@@ -986,7 +1011,7 @@ namespace Frosty.Core
                 return false;
 
             string gameProfile = project.GetValue<string>("gameProfile", ProfilesLibrary.ProfileName);
-            if (gameProfile != ProfilesLibrary.ProfileName)
+            if (gameProfile.ToLower() != ProfilesLibrary.ProfileName.ToLower())
                 return false;
 
             creationDate = new DateTime(project.GetValue<long>("creationDate"));

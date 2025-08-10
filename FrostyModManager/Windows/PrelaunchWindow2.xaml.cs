@@ -1,16 +1,20 @@
-﻿using System;
+﻿using Frosty.Controls;
+using Frosty.Core;
+using Frosty.Core.Windows;
+using FrostySdk;
+using FrostySdk.IO;
+using FrostySdk.Managers;
+using Microsoft.Win32;
+using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
-using System.IO;
-using FrostySdk;
-using Microsoft.Win32;
-using Frosty.Controls;
-using Frosty.Core;
-using FrostySdk.IO;
-using FrostySdk.Managers;
 
 namespace FrostyModManager.Windows
 {
@@ -96,8 +100,160 @@ namespace FrostyModManager.Windows
             splashWin.Show();
         }
 
+        private static bool ValidateWorkingDirContent()
+        {
+            var dir = Directory.GetCurrentDirectory();
+
+            var files = Directory.GetFiles(dir).Select(x => new FileInfo(x)).Select(x => x.Name.ToLower()).ToList();
+
+            if (files.All(x => x != "frostymodmanager.exe"))
+            {
+                return false;
+            }
+
+            if (files.All(x => x != "frostysdk.dll"))
+            {
+                return false;
+            }
+
+            if (files.All(x => x != "frostycore.dll"))
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        private static bool ValidateWorkingDirAccess()
+        {
+            var dir = Directory.GetCurrentDirectory();
+
+            try
+            {
+                var filePath = Path.Combine(dir, "test.test");
+
+                if (File.Exists(filePath))
+                {
+                    File.Delete(filePath);
+                }
+
+                var sw = File.CreateText(filePath);
+                sw.WriteLine("test");
+
+                sw.Close();
+
+                var res = File.ReadAllText(filePath);
+
+                if (!res.Contains("test"))
+                {
+                    return false;
+                }
+
+                File.Delete(filePath);
+            }
+            catch
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        private static bool ValidateDesktopDirAccess()
+        {
+            if (!OperatingSystemHelper.IsWine())
+            {
+                return true;
+            }
+
+            var dir = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+
+            if (string.IsNullOrWhiteSpace(dir))
+            {
+                return false;
+            }
+
+            if (!Directory.Exists(dir))
+            {
+                return false;
+            }
+
+            try
+            {
+                var filePath = Path.Combine(dir, "frosty.test");
+
+                if (File.Exists(filePath))
+                {
+                    File.Delete(filePath);
+                }
+
+                var sw = File.CreateText(filePath);
+                sw.WriteLine("test");
+
+                sw.Close();
+
+                var res = File.ReadAllText(filePath);
+
+                if (!res.Contains("test"))
+                {
+                    return false;
+                }
+
+                File.Delete(filePath);
+            }
+            catch
+            {
+                return false;
+            }
+
+            return true;
+        }
+
         private void Window_Loaded(object sender, RoutedEventArgs e)
         {
+            if (!ValidateWorkingDirContent())
+            {
+                var message = "Working directory does not match Frosty Mod Manager installation location.\r\n";
+
+                if (OperatingSystemHelper.IsWine())
+                {
+                    message += "\r\nOn Linux make sure Frosty Mod Manager is run from a directory accessible via a Wine drive.";
+                    message += "\r\nIf Wine is run from a Flatpak application, make sure that application has access to the Frosty Mod Manager location (can be set up with Flatseal).";
+                }
+
+                FrostyMessageBox.Show(message, "Frosty Mod Manager");
+                Close();
+                return;
+            }
+
+            if (!ValidateWorkingDirAccess())
+            {
+                var message = "Working directory does not have read and write access.\r\n";
+
+                if (OperatingSystemHelper.IsWine())
+                {
+                    message += "\r\nOn Linux make sure Frosty Mod Manager is run from a directory accessible via a Wine drive that is not Z.";
+                    message += "\r\nIf Wine is run from a Flatpak application, make sure that application has read and write access to the Frosty Mod Manager location (can be set up with Flatseal).";
+                }
+
+                FrostyMessageBox.Show(message, "Frosty Mod Manager");
+                Close();
+                return;
+            }
+
+            if (!ValidateDesktopDirAccess())
+            {
+                var message = "Desktop direcotry cannot be accessed.\r\n";
+
+                message += "\r\nOn Linux make sure application running Wine (like Bottles, Lutris) has access to /home/{user}/Desktop directory.";
+                message += "\r\nYou can use Flatseal to add this access to Flatpak applications.";
+                message += "\r\nIt is recommended to select 'All user files' for maximum compatibility.";
+
+                FrostyMessageBox.Show(message, "Frosty Mod Manager");
+                Close();
+                return;
+            }
+
             RefreshConfigurationList();
 
             RemoveConfigButton.IsEnabled = false;
@@ -157,8 +313,23 @@ namespace FrostyModManager.Windows
             LaunchConfigButton.IsEnabled = true;
         }
 
+        private void TryShowFlatpakMessage()
+        {
+            if (Config.Get("FlatpakMessage", OperatingSystemHelper.IsWine()))
+            {
+                Config.Add("FlatpakMessage", false);
+
+                var message = "If Frosty is run through Flatpak application (Bottles, Lutris, Heroic), then make sure to select 'All user files' in Flatseal for that application.";
+                message += "\r\n\r\nOtherwise Frosty Mod Manager might crash.";
+
+                FrostyMessageBox.Show(message, "Frosty Mod Manager");
+            }
+        }
+
         private void NewConfigButton_Click(object sender, RoutedEventArgs e)
         {
+            TryShowFlatpakMessage();
+
             OpenFileDialog ofd = new OpenFileDialog
             {
                 Filter = "*.exe (Game Executable)|*.exe",
@@ -171,12 +342,43 @@ namespace FrostyModManager.Windows
                 return;
             }
 
-            FileInfo fi = new FileInfo(ofd.FileName);
+            if (OperatingSystemHelper.IsWine() && !DriveHelper.IsZDrive(ofd.FileName))
+            {
+                var sb = new StringBuilder();
+                sb.Append("Game is not located on Wine Z: drive, which is not recommended.\r\n\r\n");
+                sb.Append("This can cause broken sym-links and game not booting, especially when game is launched through sandboxed environment like flatpak.");
+                sb.Append("\r\n\r\nAdd game via Z: drive for better stability.");
+
+                FrostyMessageBox.Show(sb.ToString(), "Frosty Mod Manager");
+            }
+
+            AddGameProfile(ofd.FileName, out var errorMessage);
+
+            if (!string.IsNullOrWhiteSpace(errorMessage))
+            {
+                FrostyMessageBox.Show(errorMessage, "Frosty Mod Manager");
+            }
+
+            ConfigList.Items.Refresh();
+        }
+
+        private static bool CheckGameProfile(string path)
+        {
+            FileInfo fi = new FileInfo(path);
+
+            return ProfilesLibrary.HasProfile(fi.Name.Remove(fi.Name.Length - 4));
+        }
+
+        private void AddGameProfile(string path, out string errorMessage)
+        {
+            errorMessage = string.Empty;
+
+            FileInfo fi = new FileInfo(path);
 
             // try to load game profile 
             if (!ProfilesLibrary.HasProfile(fi.Name.Remove(fi.Name.Length - 4)))
             {
-                FrostyMessageBox.Show("There was an error when trying to load game using specified profile.", "Frosty Mod Manager");
+                errorMessage = "There was an error when trying to load game using specified profile.";
                 return;
             }
 
@@ -185,7 +387,7 @@ namespace FrostyModManager.Windows
             {
                 if (config.ProfileName == fi.Name.Remove(fi.Name.Length - 4))
                 {
-                    FrostyMessageBox.Show("That game already has a configuration.");
+                    errorMessage = "That game already has a configuration.";
                     return;
                 }
             }
@@ -194,15 +396,6 @@ namespace FrostyModManager.Windows
             Config.AddGame(fi.Name.Remove(fi.Name.Length - 4), fi.DirectoryName);
             configs.Add(new FrostyConfiguration(fi.Name.Remove(fi.Name.Length - 4)));
             Config.Save();
-            //Config ini = new Config();
-            //ini.AddEntry("Init", "GamePath", fi.DirectoryName);
-            //ini.AddEntry("Init", "Profile", fi.Name.Remove(fi.Name.Length - 4));
-            //string filename = "FrostyModManager " + ini.GetEntry("Init", "Profile", "") + ".ini";
-            //ini.SaveEntries(filename);
-
-            //FrostyConfiguration cfg = new FrostyConfiguration(filename);
-            //configs.Add(cfg);
-            ConfigList.Items.Refresh();
         }
 
         private async void ConfigList_MouseDoubleClick(object sender, MouseButtonEventArgs e)
@@ -242,7 +435,9 @@ namespace FrostyModManager.Windows
         private async void LaunchConfigButton_Click(object sender, RoutedEventArgs e)
         {
             if (ConfigList.SelectedIndex == -1)
+            { 
                 return;
+            }
 
             if (ConfigList.SelectedItem is FrostyConfiguration config)
             {
@@ -250,32 +445,180 @@ namespace FrostyModManager.Windows
                 await Task.Delay(1);
                 Close();
             }
+
             ConfigList.SelectedIndex = -1;
         }
 
-        private void ScanForGamesButton_Click(object sender, RoutedEventArgs e)
+        private async void ScanForGamesButton_Click(object sender, RoutedEventArgs e)
         {
-            using (RegistryKey lmKey = Registry.LocalMachine.OpenSubKey("SOFTWARE\\WOW6432Node"))
-            {
-                int totalCount = 0;
+            TryShowFlatpakMessage();
 
-                IterateSubKeys(lmKey, ref totalCount);
+            var games = new List<string>();
+
+            await Task.Delay(1);
+
+            CancellationTokenSource cancelToken = new CancellationTokenSource();
+
+            FrostyTaskWindow.Show("Scanning for games", "", (logger) =>
+            {
+                logger.Log("Scanning registry...");
+
+                using (RegistryKey lmKey = Registry.LocalMachine.OpenSubKey("SOFTWARE\\WOW6432Node"))
+                {
+                    int totalCount = 0;
+
+                    var regGames = IterateSubKeys(lmKey, ref totalCount);
+
+                    games.AddRange(regGames);
+                }
+
+                if (OperatingSystemHelper.IsWine())
+                {
+                    logger.Log("Scanning Z: drive...");
+                }
+
+                games.AddRange(ScanZDirectory(cancelToken));
+            }, showCancelButton: true, cancelCallback: (logger) => cancelToken.Cancel());
+
+            games = games.Select(x => x.Trim()).Distinct().ToList();
+
+            games.Sort((x, y) => string.Compare(x, y, true) * -1);
+
+            foreach (var game in games)
+            {
+                FileLogger.Info($"Scanning found game candidate: '{game}'.");
+
+                AddGameProfile(game, out _);
             }
 
             ConfigList.Items.Refresh();
         }
 
-        private void IterateSubKeys(RegistryKey subKey, ref int totalCount)
+        private class PathItem
         {
+            public string Path { get; set; }
+            public int Depth { get; set; }
+        }
+
+        private List<string> ScanZDirectory(CancellationTokenSource cancelToken)
+        {
+            var res = new List<string>();
+
+            var rootPath = "Z:\\home\\";
+
+            if (!Directory.Exists(rootPath))
+            {
+                FileLogger.Info($"Drive '{rootPath}' was not found during scanning.");
+                return res;
+            }
+
+            var queue = new Queue<PathItem>();
+            
+            queue.Enqueue(new PathItem { Path = rootPath, Depth = 1 });
+
+            var mountPath = "Z:\\run\\media";
+            if (Directory.Exists(mountPath))
+            {
+                queue.Enqueue(new PathItem { Path = mountPath, Depth = 10 });
+            }
+
+            string[] files;
+            string[] dirs;
+
+            while (queue.Count > 0)
+            {
+                if (cancelToken.IsCancellationRequested)
+                {
+                    return res;
+                }
+
+                var item = queue.Dequeue();
+
+                if (!Directory.Exists(item.Path))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    files = Directory.GetFiles(item.Path, "*.exe");
+                }
+                catch
+                {
+                    continue;
+                }
+
+                foreach (var file in files)
+                {
+                    if (CheckGameProfile(file))
+                    {
+                        res.Add(file);
+                    }
+                }
+
+                if (item.Depth >= 20)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    dirs = Directory.GetDirectories(item.Path).Where(d =>
+                    {
+                        var dirTempName = Path.GetFileName(d);
+
+                        if (string.IsNullOrWhiteSpace(dirTempName))
+                        {
+                            return false;
+                        }
+
+                        dirTempName = dirTempName.Trim().ToLower();
+
+                        if (dirTempName.StartsWith("$"))
+                        {
+                            return false;
+                        }
+
+                        if (dirTempName == "cache" || dirTempName == "config" || dirTempName == "tmp")
+                        {
+                            return false;
+                        }
+
+                        if (dirTempName.StartsWith(".") && dirTempName != ".local" && dirTempName != ".var")
+                        {
+                            return false;
+                        }
+
+                        return true;
+                    }).ToArray();
+                }
+                catch
+                {
+                    continue;
+                }
+
+                foreach (var dir in dirs)
+                {
+                    queue.Enqueue(new PathItem { Path = dir, Depth = item.Depth + 1 });
+                }
+            }
+
+            return res;
+        }
+
+        private List<string> IterateSubKeys(RegistryKey subKey, ref int totalCount)
+        {
+            var res = new List<string>();
+
             foreach (string subKeyName in subKey.GetSubKeyNames())
             {
                 try
                 {
-                    IterateSubKeys(subKey.OpenSubKey(subKeyName), ref totalCount);
+                    res.AddRange(IterateSubKeys(subKey.OpenSubKey(subKeyName), ref totalCount));
                 }
-                catch (System.Security.SecurityException)
+                catch (System.Exception)
                 {
-                    // do nothing
+                    continue;
                 }
             }
 
@@ -291,33 +634,17 @@ namespace FrostyModManager.Windows
 
                     foreach (string filename in Directory.EnumerateFiles(installDir, "*.exe"))
                     {
-                        FileInfo fi = new FileInfo(filename);
-                        string nameWithoutExt = fi.Name.Replace(fi.Extension, "");
-
-                        if (ProfilesLibrary.HasProfile(nameWithoutExt))
+                        if (CheckGameProfile(filename))
                         {
-                            foreach (FrostyConfiguration config in configs)
-                            {
-                                if (config.ProfileName == fi.Name.Remove(fi.Name.Length - 4))
-                                    return;
-                            }
-
-                            Config.AddGame(fi.Name.Remove(fi.Name.Length - 4), fi.DirectoryName);
-                            configs.Add(new FrostyConfiguration(fi.Name.Remove(fi.Name.Length - 4)));
-                            //Config ini = new Config();
-                            //ini.AddEntry("Init", "GamePath", fi.DirectoryName);
-                            //ini.AddEntry("Init", "Profile", fi.Name.Remove(fi.Name.Length - 4));
-                            //string fileName = "FrostyModManager " + ini.GetEntry("Init", "Profile", "") + ".ini";
-                            //ini.SaveEntries(fileName);
-
-                            //FrostyConfiguration cfg = new FrostyConfiguration(fileName);
-                            //configs.Add(cfg);
+                            res.Add(filename);
 
                             totalCount++;
                         }
                     }
                 }
             }
+
+            return res;
         }
     }
 }

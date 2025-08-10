@@ -768,25 +768,11 @@ namespace FrostySdk
 
         public static string GetString(int hash)
         {
-            if (strings.Count == 0)
+            if (!strings.ContainsKey(hash))
             {
-                if (File.Exists("strings.txt"))
-                {
-                    using (NativeReader reader = new NativeReader(new FileStream("strings.txt", FileMode.Open, FileAccess.Read)))
-                    {
-                        while (reader.Position < reader.Length)
-                        {
-                            string str = reader.ReadLine();
-                            int strHash = Fnv1.HashString(str);
-                            if (!strings.ContainsKey(strHash))
-                                strings.Add(strHash, str);
-                        }
-                    }
-                }
+                return "0x" + hash.ToString("x8");
             }
 
-            if (!strings.ContainsKey(hash))
-                return "0x" + hash.ToString("x8");
             return strings[hash];
         }
 
@@ -802,26 +788,30 @@ namespace FrostySdk
         {
             using (MemoryStream ms = new MemoryStream())
             {
-                uint first = 0;
-                uint second = (uint)inData.Length;
+                uint first = 0, logicalOffset = 0;
+                uint second = (uint)inData.Length, logicalSize = (uint)inData.Length;
 
-                if (texture.MipCount > 1)
+                if (texture.MipCount > 1 && inData.Length > 0x10000)
                 {
-                    if (inData.Length > 0x10000)
+                    int index = 0;
+                    while (index < texture.FirstMip)
                     {
-                        int index = 0;
-                        while (second > 0x10000 && index < texture.FirstMip)
+                        // the range has a minimum size of 0x10000
+                        // the logical offset and size dont have a minimum size
+                        if (second > 0x10000)
                         {
                             first += texture.MipSizes[index];
-                            second -= texture.MipSizes[index++];
+                            second -= texture.MipSizes[index];
                         }
+                        logicalOffset += texture.MipSizes[index];
+                        logicalSize -= texture.MipSizes[index++];
                     }
                 }
 
                 if (texture.LogicalOffset != first)
                 {
-                    texture.LogicalOffset = first;
-                    texture.LogicalSize = second;
+                    texture.LogicalOffset = logicalOffset;
+                    texture.LogicalSize = logicalSize;
                 }
 
                 byte[] tmpData = null;
@@ -1197,6 +1187,35 @@ namespace FrostySdk
             }
 
             return (uint)((int)((part1 & 0xFFFF0000) + (part1 << 16)) | ((ushort)part2 + (part2 >> 16)));
+        }
+
+        /// <summary>
+        /// Loads all resolved hashes that are found within the specified file of <paramref name="path"/>.
+        /// </summary>
+        /// <param name="path">The file to be read from for hashes.</param>
+        public static void LoadStringList(string path = "strings.txt", ILogger logger = null)
+        {
+            if (!File.Exists(path))
+            {
+                return;
+            }
+
+            strings.Clear();
+
+            using (NativeReader reader = new NativeReader(new FileStream(path, FileMode.Open, FileAccess.Read)))
+            {
+                while (reader.Position < reader.Length)
+                {
+                    string currentString = reader.ReadLine();
+                    int hash = Fnv1.HashString(currentString);
+                    if (!strings.ContainsKey(hash))
+                    {
+                        strings.Add(hash, currentString);
+                    }
+
+                    logger?.Log("progress:" + (double)reader.Position / (double)reader.Length * 100.0);
+                }
+            }
         }
     }
 }

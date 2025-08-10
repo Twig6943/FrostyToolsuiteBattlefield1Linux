@@ -9,6 +9,8 @@ using FrostySdk.Managers;
 using System;
 using System.IO;
 using System.Reflection;
+using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Media.Imaging;
@@ -20,47 +22,30 @@ namespace FrostyModManager.Windows
     /// </summary>
     public partial class SplashWindow : Window
     {
-        private class SplashWindowLogger : ILogger
-        {
-            private SplashWindow parent;
-            public SplashWindowLogger(SplashWindow inParent)
-            {
-                parent = inParent;
-            }
-
-            public void Log(string text, params object[] vars)
-            {
-                string fullText = string.Format(text, vars);
-                parent.logTextBox.Dispatcher.Invoke(() =>
-                {
-                    if (fullText.StartsWith("progress:"))
-                    {
-                        fullText = fullText.Replace("progress:", "");
-                        double progress = double.Parse(fullText);
-
-                        parent.progressBar.Value = progress;
-                        parent.TaskbarItemInfo.ProgressState = System.Windows.Shell.TaskbarItemProgressState.Normal;
-                        parent.TaskbarItemInfo.ProgressValue = progress / 100.0d;
-                    }
-                    else
-                        parent.logTextBox.Text = fullText;
-                });
-            }
-
-            public void LogError(string text, params object[] vars)
-            {
-            }
-
-            public void LogWarning(string text, params object[] vars)
-            {
-            }
-        }
+        private bool isRefreshed = false;
 
         public SplashWindow()
         {
             InitializeComponent();
             versionTextBlock.Text = App.Version;
             TaskbarItemInfo = new System.Windows.Shell.TaskbarItemInfo();
+            ContentRendered += RefreshFix;
+        }
+
+        private void RefreshFix(object sender, EventArgs e)
+        {
+            if (isRefreshed || Application.Current.MainWindow != this)
+            {
+                return;
+            }
+
+            isRefreshed = true;
+
+            Application.Current.MainWindow.Height += 2;
+
+            Thread.Sleep(150);
+
+            Application.Current.MainWindow.Height -= 2;
         }
 
         private async void Window_Loaded(object sender, RoutedEventArgs e)
@@ -108,7 +93,6 @@ namespace FrostyModManager.Windows
             }
 
             Config.Save();
-            //Config.Save(App.configFilename);
 
             profileTextBlock.Text = ProfilesLibrary.DisplayName;
             bannerImage.Source = LoadBanner(ProfilesLibrary.Banner);
@@ -168,10 +152,30 @@ namespace FrostyModManager.Windows
             Close();
         }
 
+        private string ByteToString(byte[] bytes)
+        {
+            if (bytes == null)
+            {
+                return string.Empty;
+            }
+
+            var sb = new StringBuilder();
+
+            foreach ( byte b in bytes )
+            {
+                sb.Append(b);
+            }
+
+            return sb.ToString();
+        }
+
         private BitmapImage LoadBanner(byte[] banner)
         {
             if (banner == null||banner.Length == 0)
+            {
                 return null;
+            }
+
             BitmapImage bmp = new BitmapImage();
             using (MemoryStream ms = new MemoryStream(banner))
             {
@@ -182,7 +186,9 @@ namespace FrostyModManager.Windows
                 bmp.StreamSource = ms;
                 bmp.EndInit();
             }
+
             bmp.Freeze();
+            
             return bmp;
         }
 

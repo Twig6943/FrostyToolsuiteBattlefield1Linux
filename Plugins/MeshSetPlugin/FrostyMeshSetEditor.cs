@@ -299,11 +299,11 @@ namespace MeshSetPlugin
         private FbxGeometryConverter geomConverter;
         private bool flattenHierarchy = true;
         private bool exportSingleLod = false;
-        private FrostyTaskWindow task;
+        private FrostyTaskLogger logger;
 
-        public FBXExporter(FrostyTaskWindow inTask)
+        public FBXExporter(FrostyTaskLogger logger)
         {
-            task = inTask;
+            this.logger = logger;
         }
 
         /// <summary>
@@ -361,51 +361,55 @@ namespace MeshSetPlugin
                 if (meshSets[0].Lods[0].Type == MeshType.MeshType_Skinned && skeleton != "")
                 {
                     // skinned mesh requires external skeleton
-                    task.Update("Writing skeleton");
+                    logger.Log("Writing skeleton");
                     FbxNode rootNode = FBXCreateSkeleton(scene, meshAsset, skeleton, ref boneNodes);
                     scene.RootNode.AddChild(rootNode);
                 }
-                //else if (meshSets[0].Lods[0].Type == MeshType.MeshType_Composite)
-                //{
-                //    // composite skeleton has parts defined in mesh
-                //    FrostyTask.Update("Writing composite skeleton");
-                //    FbxNode rootNode = FBXCreateCompositeSkeleton(scene, meshSets[0].Lods[0].PartTransforms, ref boneNodes);
-                //    scene.RootNode.AddChild(rootNode);
-                //}
+                else if (meshSets[0].Lods[0].Type == MeshType.MeshType_Composite)
+                {
+                    // composite skeleton has parts defined in mesh
+                    logger.Log("Writing composite skeleton");
+                    FbxNode rootNode = FBXCreateCompositeSkeleton(scene, meshSets[0].Lods[0].PartTransforms, ref boneNodes);
+                    scene.RootNode.AddChild(rootNode);
+                }
 
                 currentProgress++;
+                int lodIdx = 0;
                 foreach (MeshSet meshSet in meshSets)
                 {
                     foreach (MeshSetLod lod in meshSet.Lods)
                     {
-                        task.Update("Writing " + lod.String03);
-                        FBXCreateMesh(scene, lod, boneNodes);
+                        logger.Log("Writing " + lod.ShortName);
+                        FBXCreateMesh(scene, lod, boneNodes, lodIdx);
                         if (exportSingleLod)
                         {
                             break;
                         }
+
+                        lodIdx++;
                     }
                 }
 
                 // move composite parts
-                //if (meshSets[0].Type == MeshType.MeshType_Composite)
-                //{
-                //    MeshSetLod lod = meshSets[0].Lods[0];
-                //    for (int i = 0; i < lod.PartTransforms.Count; i++)
-                //    {
-                //        LinearTransform lt = lod.PartTransforms[i];
-                //        FbxNode node = boneNodes[i];
+                if (meshSets[0].Type == MeshType.MeshType_Composite)
+                {
+                    MeshSetLod lod = meshSets[0].Lods[0];
+                    for (int i = 0; i < lod.PartTransforms.Count; i++)
+                    {
+                        LinearTransform lt = lod.PartTransforms[i];
+                        FbxNode node = boneNodes[i];
 
-                //        Matrix boneMatrix = SharpDXUtils.FromLinearTransform(lt);
+                        Matrix boneMatrix = SharpDXUtils.FromLinearTransform(lt);
 
-                //        Vector3 scale = boneMatrix.ScaleVector;
-                //        Vector3 translation = boneMatrix.TranslationVector;
-                //        Vector3 euler = SharpDXUtils.ExtractEulerAngles(boneMatrix);
+                        Vector3 scale = boneMatrix.ScaleVector;
+                        Vector3 translation = boneMatrix.TranslationVector;
+                        Vector3 euler = SharpDXUtils.ExtractEulerAngles(boneMatrix);
 
-                //        node.LclTranslation = new Vector3(translation.X, translation.Y, translation.Z);
-                //        node.LclRotation = new Vector3(euler.X, euler.Y, euler.Z);
-                //    }
-                //}
+                        node.LclTranslation = new Vector3(translation.X, translation.Y, translation.Z);
+                        node.LclRotation = new Vector3(euler.X, euler.Y, euler.Z);
+                        node.LclScaling = new Vector3(scale.X, scale.Y, scale.Z);
+                    }
+                }
 
                 using (FbxExporter exporter = new FbxExporter(manager, ""))
                 {
@@ -680,20 +684,20 @@ namespace MeshSetPlugin
         /// <summary>
         /// Creates the FBX mesh
         /// </summary>
-        private void FBXCreateMesh(FbxScene scene, MeshSetLod lod, List<FbxNode> boneNodes)
+        private void FBXCreateMesh(FbxScene scene, MeshSetLod lod, List<FbxNode> boneNodes, int lodIdx)
         {
             int indexSize = (lod.IndexUnitSize / 8);
 
             FbxNode meshNode = (flattenHierarchy) 
                 ? scene.RootNode 
-                : new FbxNode(scene, lod.String03);
+                : new FbxNode(scene, lod.ShortName);
 
             foreach (MeshSetSection section in lod.Sections)
             {
                 if (section.Name == "")
                     continue;
 
-                task.Update(progress: (currentProgress++ / (double)totalExportCount) * 100.0);
+                logger.LogProgress((currentProgress++ / (double)totalExportCount) * 100.0);
 
                 Stream chunkStream = (lod.ChunkId != Guid.Empty)
                     ? App.AssetManager.GetChunk(App.AssetManager.GetChunkEntry(lod.ChunkId))
@@ -703,7 +707,7 @@ namespace MeshSetPlugin
                 {
                     FbxNode actor = FBXExportSubObject(scene, section, lod.VertexBufferSize, indexSize, reader);
                     if (flattenHierarchy)
-                        actor.Name = $"{section.Name}:{lod.String03.Insert(lod.String03.Length - 1, ".00")}";
+                        actor.Name = $"{section.Name}:lod{lodIdx}";
                     meshNode.AddChild(actor);
 
                     if ((lod.Type == MeshType.MeshType_Skinned || lod.Type == MeshType.MeshType_Composite) && boneNodes.Count > 0)
@@ -830,7 +834,7 @@ namespace MeshSetPlugin
                     if (boneWeights[j] > 0.0f)
                     {
                         int subIndex = boneIndices[j];
-                        if (ProfilesLibrary.DataVersion != (int)ProfileVersion.Battlefield5 && ProfilesLibrary.DataVersion != (int)ProfileVersion.StarWarsBattlefrontII && ProfilesLibrary.DataVersion != (int)ProfileVersion.PlantsVsZombiesBattleforNeighborville || ProfilesLibrary.DataVersion == (int)ProfileVersion.StarWarsSquadrons)
+                        if (ProfilesLibrary.DataVersion != (int)ProfileVersion.Battlefield5 && ProfilesLibrary.DataVersion != (int)ProfileVersion.StarWarsBattlefrontII && ProfilesLibrary.DataVersion != (int)ProfileVersion.PlantsVsZombiesBattleforNeighborville && ProfilesLibrary.DataVersion != (int)ProfileVersion.StarWarsSquadrons)
                             subIndex = boneList[subIndex];
 
                         // account for proc bones
@@ -934,7 +938,6 @@ namespace MeshSetPlugin
             IntPtr buffer = fmesh.GetControlPoints();
             int uvChannelIndex = 0;
             int colorChannelIndex = 0;
-            int totalStride = 0;
 
             bool packedBinormal = false;
             bool tangentSpaceUnpack = false;
@@ -946,10 +949,13 @@ namespace MeshSetPlugin
             List<float> binormalSigns = new List<float>();
             List<object> tangentSpace = new List<object>();
 
-            foreach (GeometryDeclarationDesc.Stream stream in section.GeometryDeclDesc[0].Streams)
+            for (int j = 0; j < section.GeometryDeclDesc[0].Streams.Length; j++)
             {
+                GeometryDeclarationDesc.Stream stream = section.GeometryDeclDesc[0].Streams[j];
                 if (stream.VertexStride == 0)
+                {
                     continue;
+                }
 
                 for (int i = 0; i < section.VertexCount; i++)
                 {
@@ -959,7 +965,7 @@ namespace MeshSetPlugin
                         if (elem.Usage == VertexElementUsage.Unknown)
                             continue;
 
-                        if (currentStride >= totalStride && currentStride < (totalStride + stream.VertexStride))
+                        if (elem.StreamIndex == j && currentStride < stream.VertexStride)
                         {
                             if (elem.Usage == VertexElementUsage.Pos)
                             {
@@ -998,16 +1004,16 @@ namespace MeshSetPlugin
 
                                     if (elem.Format == VertexElementFormat.Half4)
                                     {
-                                        tangent.X = HalfUtils.Unpack(reader.ReadUShort());
-                                        tangent.Y = HalfUtils.Unpack(reader.ReadUShort());
-                                        tangent.Z = HalfUtils.Unpack(reader.ReadUShort());
+                                        tangent.X = -HalfUtils.Unpack(reader.ReadUShort());
+                                        tangent.Y = -HalfUtils.Unpack(reader.ReadUShort());
+                                        tangent.Z = -HalfUtils.Unpack(reader.ReadUShort());
                                         binormalSigns.Add(HalfUtils.Unpack(reader.ReadUShort()));
                                     }
                                     else
                                     {
-                                        tangent.X = reader.ReadFloat();
-                                        tangent.Y = reader.ReadFloat();
-                                        tangent.Z = reader.ReadFloat();
+                                        tangent.X = -reader.ReadFloat();
+                                        tangent.Y = -reader.ReadFloat();
+                                        tangent.Z = -reader.ReadFloat();
                                         binormalSigns.Add(reader.ReadFloat());
                                     }
                                 }
@@ -1068,9 +1074,9 @@ namespace MeshSetPlugin
                                     };
                                 }
 
-                                tangent.X = HalfUtils.Unpack(reader.ReadUShort());
-                                tangent.Y = HalfUtils.Unpack(reader.ReadUShort());
-                                tangent.Z = HalfUtils.Unpack(reader.ReadUShort());
+                                tangent.X = -HalfUtils.Unpack(reader.ReadUShort());
+                                tangent.Y = -HalfUtils.Unpack(reader.ReadUShort());
+                                tangent.Z = -HalfUtils.Unpack(reader.ReadUShort());
 
                                 layerElemTangent.DirectArray.Add(tangent.X, tangent.Y, tangent.Z);
                                 binormal.Z = HalfUtils.Unpack(reader.ReadUShort());
@@ -1293,13 +1299,17 @@ namespace MeshSetPlugin
                                 else
                                     reader.Position += elem.Size;
                             }
-                        }
 
-                        currentStride += elem.Size;
+                            currentStride += elem.Size;
+                        }
+                    }
+
+                    // rivals pads the vertex stride
+                    if (currentStride != stream.VertexStride)
+                    {
+                        reader.Position += stream.VertexStride - currentStride;
                     }
                 }
-
-                totalStride += stream.VertexStride;
             }
 
             if (packedBinormal)
@@ -1551,7 +1561,6 @@ namespace MeshSetPlugin
         public float FlipZ { get; set; } = 1.0f;
 
         private MeshSet meshSet;
-        private Stream resStream;
         private List<ShaderBlockDepot> shaderBlockDepots;
         private ResAssetEntry resEntry;
         private ILogger logger;
@@ -1569,7 +1578,6 @@ namespace MeshSetPlugin
 
             settings = inSettings;
             meshSet = inMeshSet;
-            resStream = App.AssetManager.GetRes(resEntry);
 
             shaderBlockDepots = new List<ShaderBlockDepot>();
             if (ProfilesLibrary.DataVersion == (int)ProfileVersion.StarWarsBattlefrontII)
@@ -1584,9 +1592,6 @@ namespace MeshSetPlugin
                     }
                 }
             }
-
-            if (meshSet.Type != MeshType.MeshType_Rigid && meshSet.Type != MeshType.MeshType_Skinned)
-                throw new FBXImportInvalidMeshTypeException();
 
             // @hack
             entry.LinkedAssets.Clear();
@@ -1611,11 +1616,10 @@ namespace MeshSetPlugin
                     {
                         if (nodeName.Contains(":"))
                         {
-                            // flat hierarchy, contains section:lod names
-                            nodeName = nodeName.Substring(nodeName.Length - 1);
-                            int lodIndex = -1;
+                            // flat hierarchy, contains section:lodX
+                            nodeName = nodeName.Substring(nodeName.LastIndexOf(':') + 4);
 
-                            if (int.TryParse(nodeName, out lodIndex))
+                            if (int.TryParse(nodeName, out int lodIndex))
                             {
                                 if (lodNodes[lodIndex] == null)
                                 {
@@ -1629,9 +1633,8 @@ namespace MeshSetPlugin
                         {
                             // standard hierarchy
                             nodeName = nodeName.Substring(nodeName.Length - 1);
-                            int lodIndex = -1;
 
-                            if (int.TryParse(nodeName, out lodIndex))
+                            if (int.TryParse(nodeName, out int lodIndex))
                             {
                                 if (lodNodes[lodIndex] == null)
                                 {
@@ -1647,10 +1650,18 @@ namespace MeshSetPlugin
                 if (lodCount < meshSet.Lods.Count)
                     throw new FBXImportInvalidLodCountException();
 
+                meshSet.ClearPartData();
+                List<BoundingBox> partBbox = new List<BoundingBox>();
+                List<LinearTransform> transforms = new List<LinearTransform>();
                 // process each lod
                 for (int i = 0; i < meshSet.Lods.Count; i++)
                 {
-                    ProcessLod(lodNodes[i], i);
+                    ProcessLod(lodNodes[i], i, ref partBbox, ref transforms);
+                }
+
+                if (meshSet.Type == MeshType.MeshType_Composite)
+                {
+                    meshSet.SetParts(ToAxisAlignedBoundingBoxes(partBbox), transforms);
                 }
             }
 
@@ -1659,6 +1670,28 @@ namespace MeshSetPlugin
             // modify resource
             App.AssetManager.ModifyRes(resRid, meshSet);
             entry.LinkAsset(resEntry);
+        }
+
+        private List<AxisAlignedBox> ToAxisAlignedBoundingBoxes(List<BoundingBox> inBoundingBoxes)
+        {
+            List<AxisAlignedBox> retVal = new List<AxisAlignedBox>(inBoundingBoxes.Count);
+
+            foreach (BoundingBox bbox in inBoundingBoxes)
+            {
+                Vec3 min = new Vec3();
+                min.x = bbox.Minimum.X;
+                min.y = bbox.Minimum.Y;
+                min.z = bbox.Minimum.Z;
+
+                Vec3 max = new Vec3();
+                max.x = bbox.Maximum.X;
+                max.y = bbox.Maximum.Y;
+                max.z = bbox.Maximum.Z;
+                
+                retVal.Add(new AxisAlignedBox(){min = min, max =  max});
+            }
+
+            return retVal;
         }
 
         private float CubeMapFaceID(float inX, float inY, float inZ)
@@ -1713,7 +1746,7 @@ namespace MeshSetPlugin
             FbxDocumentInfo info = scene.SceneInfo;
         }
 
-        private void ProcessLod(List<FbxNode> nodes, int lodIndex)
+        private void ProcessLod(List<FbxNode> nodes, int lodIndex, ref List<BoundingBox> partBbox, ref List<LinearTransform> transforms)
         {
             MeshSetLod meshLod = meshSet.Lods[lodIndex];
             List<FbxNode> sectionNodes = new List<FbxNode>();
@@ -1868,6 +1901,11 @@ namespace MeshSetPlugin
                 }
             }
 
+            if (meshSet.Type == MeshType.MeshType_Composite)
+            {
+                CalculateCompositePartDataForLod(sectionNodeMapping, meshLod, ref partBbox, ref transforms);
+            }
+
             if (ProfilesLibrary.DataVersion == (int)ProfileVersion.StarWarsBattlefrontII)
             {
                 // update shader block depot mesh parameters
@@ -1938,6 +1976,186 @@ namespace MeshSetPlugin
             }
         }
 
+        private LinearTransform FbxTransformToLinearTransform(FbxNode inFbxNode)
+        {
+            LinearTransform trns = new LinearTransform();
+            float pi = (float)(Math.PI / 180.0);
+
+            // Setup the rotation matrix
+            Vector3 fbxRotation = new Vector3(inFbxNode.LclRotation.X * pi, inFbxNode.LclRotation.Y * pi, inFbxNode.LclRotation.Z * pi);
+
+            Matrix rotMatrix = Matrix.Identity;
+
+            rotMatrix *= Matrix.RotationX(fbxRotation.X);
+            rotMatrix *= Matrix.RotationY(fbxRotation.Y);
+            rotMatrix *= Matrix.RotationZ(fbxRotation.Z);
+
+            // Now create the LinearTransform matrix
+            Vector3 nodeScale = inFbxNode.LclScaling;
+            Matrix fbMatrix = new Matrix();
+            fbMatrix.M11 = rotMatrix.M11 * nodeScale.X;
+            fbMatrix.M12 = rotMatrix.M12 * nodeScale.Y;
+            fbMatrix.M13 = rotMatrix.M13 * nodeScale.Z;
+
+            fbMatrix.M21 = rotMatrix.M21 * nodeScale.X;
+            fbMatrix.M22 = rotMatrix.M22 * nodeScale.Y;
+            fbMatrix.M23 = rotMatrix.M23 * nodeScale.Z;
+
+            fbMatrix.M31 = rotMatrix.M31 * nodeScale.X;
+            fbMatrix.M32 = rotMatrix.M32 * nodeScale.Y;
+            fbMatrix.M33 = rotMatrix.M33 * nodeScale.Z;
+
+            fbMatrix.M41 = inFbxNode.LclTranslation.X;
+            fbMatrix.M42 = inFbxNode.LclTranslation.Y;
+            fbMatrix.M43 = inFbxNode.LclTranslation.Z;
+
+            fbMatrix.M14 = 0f;
+            fbMatrix.M24 = 0f;
+            fbMatrix.M34 = 0f;
+            fbMatrix.M44 = 1f;
+
+            // Converting from the SharpDX Matrix
+            trns.trans.x = inFbxNode.LclTranslation.X;
+            trns.trans.y = inFbxNode.LclTranslation.Y;
+            trns.trans.z = inFbxNode.LclTranslation.Z;
+
+            trns.right.x = fbMatrix.M11;
+            trns.right.y = fbMatrix.M12;
+            trns.right.z = fbMatrix.M13;
+
+            trns.up.x = fbMatrix.M21;
+            trns.up.y = fbMatrix.M22;
+            trns.up.z = fbMatrix.M23;
+
+            trns.forward.x = fbMatrix.M31;
+            trns.forward.y = fbMatrix.M32;
+            trns.forward.z = fbMatrix.M33;
+
+            return trns;
+        }
+
+        private List<Vector3> GetVerticesFromCluster(FbxMesh fmesh, FbxCluster cluster, Matrix sectionMatrix)
+        {
+            IntPtr verticesBuffer = fmesh.GetControlPoints();
+
+            int[] controlPointIndices = cluster.GetControlPointIndices();
+            int controlPointIndiceCount = controlPointIndices.Count();
+            List<int> vertexIndices = new List<int>();
+            List<Vector3> vertexPositions = new List<Vector3>();
+
+            for (int i = 0; i < fmesh.PolygonCount; i++)
+            {
+                for (int j = 0; j < 3; j++)
+                {
+                    int vertexIndex = fmesh.GetPolygonIndex(i, j);
+
+                    if (controlPointIndiceCount > vertexIndex && controlPointIndices[vertexIndex] >= 0)
+                    {
+                        vertexIndices.Add(vertexIndex);
+                    }
+                }
+            }
+
+            foreach (int vIdx in vertexIndices)
+            {
+                Vector3 position;
+                unsafe
+                {
+                    double* pointsPtr = (double*)(verticesBuffer + (vIdx * 32));
+                    position = new Vector3((float)pointsPtr[XAxis] * Scale, (float)pointsPtr[YAxis] * Scale, (float)(pointsPtr[ZAxis] * FlipZ) * Scale);
+                }
+
+                Vector4 tmp = Vector3.Transform(position, sectionMatrix);
+                position.X = tmp.X;
+                position.Y = tmp.Y;
+                position.Z = tmp.Z;
+
+                vertexPositions.Add(position);
+            }
+
+            return vertexPositions;
+        }
+
+        private void CalculateCompositePartDataForLod(List<FbxNode> nodes, MeshSetLod meshLod, ref List<BoundingBox> bbox, ref List<LinearTransform> transforms)
+        {
+            List<LinearTransform> partTransforms = new List<LinearTransform>();
+            List<AxisAlignedBox> partAABBs = new List<AxisAlignedBox>();
+            List<List<int>> partIndices = new List<List<int>>();
+            Dictionary<ushort, List<Vector3>> boneToVerticesMapping = new Dictionary<ushort, List<Vector3>>();
+
+            foreach (FbxNode node in nodes)
+            {
+                FbxNodeAttribute attr = node.GetNodeAttribute(FbxNodeAttribute.EType.eMesh);
+                FbxMesh fmesh = new FbxMesh(attr);
+                FbxSkin fskin = (fmesh.GetDeformerCount(FbxDeformer.EDeformerType.eSkin) != 0)
+                    ? new FbxSkin(fmesh.GetDeformer(0, FbxDeformer.EDeformerType.eSkin))
+                    : null;
+
+                if (fskin == null)
+                    return;
+                List<int> boneList = new List<int>();
+
+                foreach (FbxCluster cluster in fskin.Clusters)
+                {
+                    if (cluster.ControlPointIndicesCount == 0)
+                        continue;
+
+                    FbxNode bone = cluster.GetLink();
+                    ushort idx = ushort.Parse(bone.Name.Substring(bone.Name.LastIndexOf('_') + 1));
+                    boneList.Add(idx);
+
+                    Matrix sectionMatrix = new FbxMatrix(node.EvaluateGlobalTransform()).ToSharpDX();
+
+                    if (!boneToVerticesMapping.ContainsKey(idx))
+                    {
+                        while (partTransforms.Count <= idx)
+                        {
+                            partTransforms.Add(LinearTransform.Identity);
+                        }
+                        partTransforms[idx] = FbxTransformToLinearTransform(bone);
+                        while (transforms.Count <= idx)
+                        {
+                            transforms.Add(LinearTransform.Identity);
+                        }
+                        transforms[idx] = partTransforms[idx];
+
+                        boneToVerticesMapping.Add(idx, GetVerticesFromCluster(fmesh, cluster, sectionMatrix));
+                    }
+                    else
+                    {
+                        boneToVerticesMapping[idx].AddRange(GetVerticesFromCluster(fmesh, cluster, sectionMatrix));
+                    }
+                }
+
+                partIndices.Add(boneList);
+            }
+
+            foreach(KeyValuePair<ushort, List<Vector3>> boneAndVertices in boneToVerticesMapping)
+            {
+                (AxisAlignedBox, BoundingBox) aabbs = AABBFromPoints(boneAndVertices.Value);
+                while (partAABBs.Count <= boneAndVertices.Key)
+                {
+                    partAABBs.Add(default);
+                }
+                partAABBs[boneAndVertices.Key] = aabbs.Item1;
+                if (bbox.Count > boneAndVertices.Key)
+                {
+                    bbox[boneAndVertices.Key] = BoundingBox.Merge(bbox[boneAndVertices.Key], aabbs.Item2);
+                }
+                else
+                {
+                    for (int i = bbox.Count; i < boneAndVertices.Key; i++)
+                    {
+                        bbox.Add(new BoundingBox());
+                    }
+                    bbox.Add(aabbs.Item2);
+                }
+            }
+
+            meshLod.ClearPartData();
+            meshLod.SetParts(partTransforms, partAABBs, partIndices);
+        }
+
         private void ProcessSection(FbxNode[] sectionNodes, MeshSetLod meshLod, int sectionIndex, MemoryStream verticesBuffer, List<uint> indicesBuffer, uint vertexOffset, ref uint startIndex)
         {
             MeshSetSection meshSection = meshLod.Sections[sectionIndex];
@@ -1984,7 +2202,7 @@ namespace MeshSetPlugin
                     }
 
                     // Madden19/FIFA17/FIFA18/Madden20
-                    if (ProfilesLibrary.DataVersion == (int)ProfileVersion.Madden19 || ProfilesLibrary.DataVersion == (int)ProfileVersion.Fifa17 || ProfilesLibrary.DataVersion == (int)ProfileVersion.Fifa18 || ProfilesLibrary.DataVersion == (int)ProfileVersion.Madden20)
+                    if (meshSet.Type != MeshType.MeshType_Composite && (ProfilesLibrary.DataVersion == (int)ProfileVersion.Madden19 || ProfilesLibrary.DataVersion == (int)ProfileVersion.Fifa17 || ProfilesLibrary.DataVersion == (int)ProfileVersion.Fifa18 || ProfilesLibrary.DataVersion == (int)ProfileVersion.Madden20))
                     {
                         // @todo: if works, then merge with below
                         for (int i = 0; i < skeleton.BoneNames.Count; i++)
@@ -1998,8 +2216,12 @@ namespace MeshSetPlugin
                     }
 
                     // MEC/BF1/SWBF2/BFV/Anthem/FIFA19/FIFA20/BFN/SWS
-                    else if (ProfilesLibrary.DataVersion == (int)ProfileVersion.MirrorsEdgeCatalyst || ProfilesLibrary.DataVersion == (int)ProfileVersion.Battlefield5 || ProfilesLibrary.DataVersion == (int)ProfileVersion.StarWarsBattlefrontII || ProfilesLibrary.DataVersion == (int)ProfileVersion.Fifa19 ||
-                             ProfilesLibrary.DataVersion == (int)ProfileVersion.Fifa20 || ProfilesLibrary.DataVersion == (int)ProfileVersion.StarWarsSquadrons)
+                    else if (meshSet.Type != MeshType.MeshType_Composite && (ProfilesLibrary.DataVersion == (int)ProfileVersion.MirrorsEdgeCatalyst ||
+                                                                             ProfilesLibrary.DataVersion == (int)ProfileVersion.Battlefield5 ||
+                                                                             ProfilesLibrary.DataVersion == (int)ProfileVersion.StarWarsBattlefrontII ||
+                                                                             ProfilesLibrary.DataVersion == (int)ProfileVersion.Fifa19 ||
+                                                                             ProfilesLibrary.DataVersion == (int)ProfileVersion.Fifa20 ||
+                                                                             ProfilesLibrary.DataVersion == (int)ProfileVersion.StarWarsSquadrons))
                     {
                         // ushort/uint, can handle long lists so just put all bones into sections
                         for (int i = 0; i < skeleton.BoneNames.Count; i++)
@@ -2032,12 +2254,28 @@ namespace MeshSetPlugin
                                 continue;
 
                             FbxNode bone = cluster.GetLink();
-                            ushort idx = (ushort)skeleton.BoneNames.IndexOf(bone.Name);
+                            ushort idx;
+                            if(meshSet.Type == MeshType.MeshType_Composite)
+                            {
+                                // get id from bone name, composite bone names should always be in the format PART_X
+                                idx = ushort.Parse(bone.Name.Substring(bone.Name.LastIndexOf('_') + 1));
+                            }
+                            else
+                            {
+                                idx = (ushort)skeleton.BoneNames.IndexOf(bone.Name);
+                            }
 
                             if (!boneList.Contains(idx))
                             {
                                 boneList.Add(idx);
-                                boneNames.Add(skeleton.BoneNames[idx]);
+                                if(meshSet.Type == MeshType.MeshType_Composite)
+                                {
+                                    boneNames.Add(bone.Name);
+                                }
+                                else
+                                {
+                                    boneNames.Add(skeleton.BoneNames[idx]);
+                                }
                             }
                         }
                     }
@@ -2100,8 +2338,15 @@ namespace MeshSetPlugin
                         }
                         else
                         {
-                            boneIdx = (ushort)skeleton.BoneNames.IndexOf(bone.Name);
-                            boneIdx = (ushort)boneList.IndexOf(boneIdx);
+                            if(meshSet.Type == MeshType.MeshType_Composite)
+                            {
+                                boneIdx = ushort.Parse(bone.Name.Substring(bone.Name.LastIndexOf('_') + 1));
+                            }
+                            else
+                            {
+                                boneIdx = (ushort)skeleton.BoneNames.IndexOf(bone.Name);
+                                boneIdx = (ushort)boneList.IndexOf(boneIdx);
+                            }
                         }
 
                         for (int i = 0; i < tmpIndices.Length; i++)
@@ -2518,12 +2763,14 @@ namespace MeshSetPlugin
                 using (NativeWriter chunkWriter = new NativeWriter(verticesBuffer, true))
                 {
                     chunkWriter.Position = chunkWriter.Length;
-                    int totalStride = 0;
 
-                    foreach (GeometryDeclarationDesc.Stream stream in meshSection.GeometryDeclDesc[0].Streams)
+                    for (int i = 0; i < meshSection.GeometryDeclDesc[0].Streams.Length; i++)
                     {
+                        GeometryDeclarationDesc.Stream stream = meshSection.GeometryDeclDesc[0].Streams[i];
                         if (stream.VertexStride == 0)
+                        {
                             continue;
+                        }
 
                         foreach (DbObject vertex in vertices)
                         {
@@ -2534,8 +2781,22 @@ namespace MeshSetPlugin
                             Vector3 tangent = Vector3.TransformNormal(vertex.GetValue<Vector3>("Tangent"), sectionMatrix);
                             Vector3 binormal = Vector3.TransformNormal(vertex.GetValue<Vector3>("Binormal"), sectionMatrix);
 
+                            // for some reason the tangent gets stored inverted
+                            tangent *= -1.0f;
+
                             ushort[] finalBoneIndices = vertex.GetValue<ushort[]>("BoneIndices");
                             byte[] finalBoneWeights = vertex.GetValue<byte[]>("BoneWeights");
+
+                            // for some reason some rigid meshes have bone indices and weights
+                            // so we just make them all 0
+                            if (finalBoneIndices == null)
+                            {
+                                finalBoneIndices = new ushort[8];
+                            }
+                            if (finalBoneWeights == null)
+                            {
+                                finalBoneWeights = new byte[8];
+                            }
 
                             int currentStride = 0;
                             foreach (GeometryDeclarationDesc.Element elem in meshSection.GeometryDeclDesc[0].Elements)
@@ -2543,7 +2804,7 @@ namespace MeshSetPlugin
                                 if (elem.Usage == VertexElementUsage.Unknown)
                                     continue;
 
-                                if (currentStride >= totalStride && currentStride < (totalStride + stream.VertexStride))
+                                if (elem.StreamIndex == i && currentStride < stream.VertexStride)
                                 {
                                     switch (elem.Usage)
                                     {
@@ -2572,8 +2833,31 @@ namespace MeshSetPlugin
 
                                         case VertexElementUsage.BinormalSign:
                                             {
-                                                if (elem.Format == VertexElementFormat.Half) chunkWriter.Write(HalfUtils.Pack((Vector3.Dot(Vector3.Cross(normal, tangent), binormal)) < 0.0f ? 1.0f : -1.0f));
-                                                else chunkWriter.Write((Vector3.Dot(Vector3.Cross(normal, tangent), binormal)) < 0.0f ? 1.0f : -1.0f);
+                                                if (elem.Format == VertexElementFormat.Half)
+                                                {
+                                                    chunkWriter.Write(HalfUtils.Pack((Vector3.Dot(binormal, Vector3.Cross(normal, tangent))) < 0.0f ? 1.0f : -1.0f));
+                                                }
+                                                else if (elem.Format == VertexElementFormat.Half4 || elem.Format == VertexElementFormat.Float4)
+                                                {
+                                                    if (elem.Format == VertexElementFormat.Half4)
+                                                    {
+                                                        chunkWriter.Write(HalfUtils.Pack(tangent.X));
+                                                        chunkWriter.Write(HalfUtils.Pack(tangent.Y));
+                                                        chunkWriter.Write(HalfUtils.Pack(tangent.Z));
+                                                        chunkWriter.Write(HalfUtils.Pack((Vector3.Dot(binormal, Vector3.Cross(normal, tangent))) < 0.0f ? 1.0f : -1.0f));
+                                                    }
+                                                    else
+                                                    {
+                                                        chunkWriter.Write(tangent.X);
+                                                        chunkWriter.Write(tangent.Y);
+                                                        chunkWriter.Write(tangent.Z);
+                                                        chunkWriter.Write((Vector3.Dot(binormal, Vector3.Cross(normal, tangent))) < 0.0f ? 1.0f : -1.0f);
+                                                    }
+                                                }
+                                                else
+                                                {
+                                                    chunkWriter.Write((Vector3.Dot(binormal, Vector3.Cross(normal, tangent))) < 0.0f ? 1.0f : -1.0f);
+                                                }
                                             }
                                             break;
 
@@ -2827,13 +3111,17 @@ namespace MeshSetPlugin
                                             }
                                             break;
                                     }
-                                }
 
-                                currentStride += elem.Size;
+                                    currentStride += elem.Size;
+                                }
+                            }
+
+                            // rivals pads the vertex stride
+                            if (currentStride != stream.VertexStride)
+                            {
+                                chunkWriter.Position += stream.VertexStride - currentStride;
                             }
                         }
-
-                        totalStride += stream.VertexStride;
                     }
 
                     meshSection.VertexCount += (uint)vertices.Count;
@@ -2847,13 +3135,57 @@ namespace MeshSetPlugin
                     numIndices++;
                 }
 
+                // generate part bounding box
+                /*if(meshSet.Type == MeshType.MeshType_Composite)
+                {
+                    List<Vector3> verticePositions = new List<Vector3>();
+                    foreach (DbObject vertex in vertices)
+                    {
+                        Vector4 tmp = vertex.GetValue<Vector4>("Pos");
+                        Vector4 position = Vector3.Transform(new Vector3(tmp.X, tmp.Y, tmp.Z), sectionMatrix);
+                        verticePositions.Add(new Vector3(position.X, position.Y, position.Z));
+                    }
+
+                    //partBoundingBoxes.Add(AABBFromPoints(verticePositions));
+
+                    // TEMP
+                    // For now, just set the part indice to include everything
+                    int partIndice = 0;
+                    for (int i = 0; i < boneList.Count; i++)
+                    {
+                        partIndice |= 1 << i;
+                    }
+                    partIndices.Add(partIndice);
+                }*/
                 meshSection.PrimitiveCount += (uint)(numIndices / 3);
 
                 startIndex += (uint)numIndices;
                 indexOffset += (uint)vertices.Count;
             }
+
+        }
+
+        private (AxisAlignedBox, BoundingBox) AABBFromPoints(List<Vector3> points)
+        {
+            BoundingBox bbox = BoundingBox.FromPoints(points.ToArray());
+
+            Vec3 min = new Vec3();
+            min.x = bbox.Minimum.X;
+            min.y = bbox.Minimum.Y;
+            min.z = bbox.Minimum.Z;
+
+            Vec3 max = new Vec3();
+            max.x = bbox.Maximum.X;
+            max.y = bbox.Maximum.Y;
+            max.z = bbox.Maximum.Z;
+
+            AxisAlignedBox aabb = new AxisAlignedBox();
+            aabb.min = min;
+            aabb.max = max;
+            return (aabb, bbox);
         }
     }
+
     #endregion
 
     class VariationToStringConverter : IValueConverter
@@ -3432,6 +3764,23 @@ namespace MeshSetPlugin
                 ResAssetEntry rEntry = App.AssetManager.GetResEntry(resRid);
 
                 meshSet = App.AssetManager.GetResAs<MeshSet>(rEntry);
+                /*if (meshSet.Lods[0].SectionCount == 2)
+                {
+                    ResAssetEntry meshset = App.AssetManager.GetResEntry(
+                        "worlds/themepark/vegetation/themepark_rome_busha_indestructable_mesh");
+                    MeshSet donorMeshSet = App.AssetManager.GetResAs<MeshSet>(meshset);
+
+                    for (int i = 0; i < meshSet.Lods.Count; i++)
+                    {
+                        MeshSetLod lod = meshSet.Lods[i];
+                        MeshSetLod donorLod = donorMeshSet.Lods[0];
+
+                        lod.SectionCount++;
+                        MeshSetSection donorSection = donorLod.Sections[1];
+                        lod.Sections.Add(donorSection);
+                    }
+                    App.AssetManager.ModifyRes(meshSet.ResourceId, meshSet.SaveBytes(), meshSet.ResourceMeta);
+                }*/
                 if (ProfilesLibrary.DataVersion == (int)ProfileVersion.Madden19 || ProfilesLibrary.DataVersion == (int)ProfileVersion.Madden20)
                     meshSet.TangentSpaceCompressionType = (TangentSpaceCompressionType)((dynamic)RootObject).TangentSpaceCompressionType;
 
@@ -3496,7 +3845,7 @@ namespace MeshSetPlugin
 
             foreach (MeshSetLod lod in meshSet.Lods)
             {
-                PreviewMeshLodData lodData = new PreviewMeshLodData() { Name = lod.String03 };
+                PreviewMeshLodData lodData = new PreviewMeshLodData() { Name = lod.ShortName };
                 foreach (MeshSetSection section in lod.Sections)
                 {
                     if (lod.IsSectionRenderable(section) && section.PrimitiveCount > 0)
@@ -3919,6 +4268,10 @@ namespace MeshSetPlugin
                             AssetClassGuid guid = material.GetInstanceGuid();
 
                             MeshVariationMaterial varMaterial = mv.GetMaterial(guid.ExportedGuid);
+                            if (varMaterial == null)
+                            {
+                                continue;
+                            }
                             MeshSetMaterialDetails details = new MeshSetMaterialDetails();
                             variationDetails.MaterialCollection = new MeshMaterialCollection.Container(new MeshMaterialCollection(asset, new PointerRef(varMaterial.MaterialVariationAssetGuid)));
                         }
@@ -4075,30 +4428,26 @@ namespace MeshSetPlugin
 
                 if (bOk)
                 {
-                    ulong resRid = ((dynamic)RootObject).MeshSetResource;
-                    ResAssetEntry resEntry = App.AssetManager.GetResEntry(resRid);
-                    Stream resStream = App.AssetManager.GetRes(resEntry);
-
                     EbxAsset localAsset = asset;
                     EbxAssetEntry localEntry = AssetEntry as EbxAssetEntry;
                     //List<ShaderBlockEntry> tmpShaderBlockEntries = new List<ShaderBlockEntry>();
 
                     FrostyTaskWindow.Show("Importing", "", (task) =>
                     {
-                        Application.Current.Dispatcher.Invoke(() =>
+                        try
                         {
-                            try
+                            // import
+                            FBXImporter importer = new FBXImporter(logger);
+                            importer.ImportFBX(ofd.FileName, meshSet, localAsset, localEntry, settings);
+                        }
+                        catch (Exception exp)
+                        {
+                            if (!localEntry.IsAdded)
                             {
-                                // import
-                                FBXImporter importer = new FBXImporter(logger);
-                                importer.ImportFBX(ofd.FileName, meshSet, localAsset, localEntry, settings);
+                                App.AssetManager.RevertAsset(localEntry);
                             }
-                            catch (Exception exp)
-                            {
-                                App.AssetManager.RevertAsset(AssetEntry);
-                                logger.LogError(exp.Message);
-                            }
-                        });
+                            logger.LogError(exp.Message);
+                        }
                     });
 
                     // @todo: Reload the main mesh shader block depot

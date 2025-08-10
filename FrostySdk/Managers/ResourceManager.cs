@@ -36,7 +36,7 @@ namespace FrostySdk.Managers
 
             if (ProfilesLibrary.DataVersion != (int)ProfileVersion.Fifa19 && ProfilesLibrary.DataVersion != (int)ProfileVersion.Madden20)
             {
-                WriteToLog("Loading catalogs");
+                WriteToLog("Loading Catalogs");
                 foreach (string catalogName in fs.Catalogs)
                 {
                     LoadCatalog("native_data/" + catalogName + "/cas.cat");
@@ -183,6 +183,17 @@ namespace FrostySdk.Managers
             {
                 using (CasReader reader = new CasReader(bufferReader.CreateViewStream(offset, size)))
                     buffer = reader.Read();
+            }
+
+            return (buffer != null) ? new MemoryStream(buffer) : null;
+        }
+        public Stream GetRawResourceData(long offset, long size)
+        {
+            byte[] buffer = null;
+            using (NativeReader bufferReader = new NativeReader(new FileStream(fs.CacheName + "_sbdata.cas", FileMode.Open, FileAccess.Read)))
+            {
+                using (NativeReader reader = new NativeReader(bufferReader.CreateViewStream(offset, size)))
+                    buffer = reader.ReadToEnd();
             }
 
             return (buffer != null) ? new MemoryStream(buffer) : null;

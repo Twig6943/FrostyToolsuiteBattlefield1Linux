@@ -114,8 +114,9 @@ namespace FrostyModManager
             Config.Load();
             //ini.LoadEntries("DefaultSettings.ini");
 
-            if (Config.Get<bool>("UpdateCheck", true) || Config.Get<bool>("UpdateCheckPrerelease", false))
-                CheckVersion();
+            // Disable update check
+            //if (Config.Get<bool>("UpdateCheck", true) || Config.Get<bool>("UpdateCheckPrerelease", false))
+            //    CheckVersion();
 
             //string defaultConfigname = ini.GetEntry("Init", "DefaultConfiguration", "");
 
@@ -124,7 +125,17 @@ namespace FrostyModManager
             {
                 string prof = Config.Get<string>("DefaultProfile", null);
                 if (!string.IsNullOrEmpty(prof))
-                    defaultConfig = new FrostyConfiguration(prof);
+                {
+                    try
+                    {
+                        defaultConfig = new FrostyConfiguration(prof);
+                    }
+                    catch (System.IO.FileNotFoundException)
+                    {
+                        Config.RemoveGame(prof); // couldn't find the exe, so remove it from the profile list
+                        Config.Save();
+                    }
+                }
                 else
                 {
                     Config.Add("UseDefaultProfile", false);
@@ -217,7 +228,7 @@ namespace FrostyModManager
                     });
                 }
             }
-            catch (Exception e)
+            catch
             {
                 // System.Threading.Tasks.Task.Run(() =>
                 // {

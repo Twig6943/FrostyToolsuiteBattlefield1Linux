@@ -15,30 +15,13 @@ namespace Frosty.ModSupport
     {
         private class ManifestBundleAction
         {
-            private static readonly object resourceLock = new object();
 
             public List<Sha1> DataRefs { get; } = new List<Sha1>();
-            public List<Sha1> BundleRefs { get; } = new List<Sha1>();
             public List<CasFileEntry> FileInfos { get; } = new List<CasFileEntry>();
-            public List<byte[]> BundleBuffers { get; } = new List<byte[]>();
 
-            public bool HasErrored => Exception != null;
             public Exception Exception { get; private set; }
 
-            private List<ModBundleInfo> bundles;
-            private ManualResetEvent doneEvent;
-            private FrostyModExecutor parent;
-            private CancellationToken cancelToken;
-
-            public ManifestBundleAction(List<ModBundleInfo> inBundles, ManualResetEvent inDoneEvent, FrostyModExecutor inParent, CancellationToken inCancelToken)
-            {
-                bundles = inBundles;
-                doneEvent = inDoneEvent;
-                parent = inParent;
-                cancelToken = inCancelToken;
-            }
-
-            private void Run()
+            public ManifestBundleAction(List<ModBundleInfo> bundles, FrostyModExecutor parent, CancellationToken cancelToken)
             {
                 try
                 {
@@ -180,7 +163,7 @@ namespace Frosty.ModSupport
                             ebx.SetValue("originalSize", entry.OriginalSize);
                             bundleObj.GetValue<DbObject>("ebx").Add(ebx);
 
-                            ManifestFileInfo fi = new ManifestFileInfo {file = new ManifestFileRef(bundleFile.file.CatalogIndex, false, 0)};
+                            ManifestFileInfo fi = new ManifestFileInfo { file = new ManifestFileRef(bundleFile.file.CatalogIndex, false, 0) };
                             manifestBundle.files.Insert(idx++, fi);
 
                             DataRefs.Add(entry.Sha1);
@@ -239,7 +222,7 @@ namespace Frosty.ModSupport
                             res.SetValue("resType", entry.ResType);
                             res.SetValue("resMeta", entry.ResMeta);
                             bundleObj.GetValue<DbObject>("res").Add(res);
-                            ManifestFileInfo fi = new ManifestFileInfo {file = new ManifestFileRef(bundleFile.file.CatalogIndex, false, 0)};
+                            ManifestFileInfo fi = new ManifestFileInfo { file = new ManifestFileRef(bundleFile.file.CatalogIndex, false, 0) };
                             manifestBundle.files.Insert(idx++, fi);
 
                             DataRefs.Add(entry.Sha1);
@@ -247,6 +230,12 @@ namespace Frosty.ModSupport
                         }
 
                         DbObject chunkMeta = bundleObj.GetValue<DbObject>("chunkMeta");
+                        
+                        if (bundle.Add.Chunks.Count > 0 && chunkMeta == null)
+                        {
+                            chunkMeta = DbObject.CreateList();
+                            bundleObj.SetValue("chunkMeta", chunkMeta);
+                        }
 
                         // modify chunks
                         int chunkIndex = 0;
@@ -309,14 +298,14 @@ namespace Frosty.ModSupport
 
                             if (entry.FirstMip != -1)
                             {
-                                 chunk.SetValue("rangeStart", entry.RangeStart);
+                                chunk.SetValue("rangeStart", entry.RangeStart);
                                 chunk.SetValue("rangeEnd", entry.RangeEnd);
                                 meta.GetValue<DbObject>("meta").SetValue("firstMip", entry.FirstMip);
                             }
 
                             bundleObj.GetValue<DbObject>("chunks").Add(chunk);
 
-                            ManifestFileInfo fi = new ManifestFileInfo {file = new ManifestFileRef(bundleFile.file.CatalogIndex, false, 0)};
+                            ManifestFileInfo fi = new ManifestFileInfo { file = new ManifestFileRef(bundleFile.file.CatalogIndex, false, 0) };
                             manifestBundle.files.Insert(idx++, fi);
 
                             DataRefs.Add(entry.Sha1);
@@ -331,7 +320,10 @@ namespace Frosty.ModSupport
 
                             long startPos = writer.Position;
 
-                            writer.Write(0x9D798ED5, Endian.Big);
+                            if (ProfilesLibrary.DataVersion != (int)ProfileVersion.Battlefield5) //bfv changed the bundle magic for some reason
+                                writer.Write(0x9D798ED5, Endian.Big);
+                            else
+                                writer.Write(0x8C6E84DD, Endian.Big);
                             writer.Write(bundleObj.GetValue<DbObject>("ebx").Count + bundleObj.GetValue<DbObject>("res").Count + bundleObj.GetValue<DbObject>("chunks").Count, Endian.Big);
                             writer.Write(bundleObj.GetValue<DbObject>("ebx").Count, Endian.Big);
                             writer.Write(bundleObj.GetValue<DbObject>("res").Count, Endian.Big);
@@ -425,27 +417,18 @@ namespace Frosty.ModSupport
                         }
 
                         byte[] bundleBuffer = ms.ToArray();
+                        ms.Dispose();
                         Sha1 newSha1 = Utils.GenerateSha1(bundleBuffer);
 
-                        BundleRefs.Add(newSha1);
                         DataRefs.Add(newSha1);
-                        FileInfos.Add(new CasFileEntry{ Entry = null, FileInfo = bundleFile });
-                        BundleBuffers.Add(bundleBuffer);
+                        FileInfos.Add(new CasFileEntry { Entry = null, FileInfo = bundleFile });
+                        parent.archiveData.TryAdd(newSha1, new ArchiveInfo() { Data = bundleBuffer });
                     }
                 }
                 catch (Exception e)
                 {
                     Exception = e;
                 }
-            }
-
-            public void ThreadPoolCallback(object threadContext)
-            {
-                Run();
-
-                // are all threads done?
-                if (Interlocked.Decrement(ref parent.numTasks) == 0)
-                    doneEvent.Set();
             }
         }
     }

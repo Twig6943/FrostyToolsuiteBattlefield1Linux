@@ -4,6 +4,7 @@ using FrostySdk.IO;
 using FrostySdk.Managers;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Threading;
 
@@ -78,20 +79,6 @@ namespace Frosty.ModSupport
                     if (basePath.Equals(path))
                         isBase = true;
 
-                    if (ProfilesLibrary.DataVersion == (int)ProfileVersion.DragonAgeInquisition || ProfilesLibrary.DataVersion == (int)ProfileVersion.Battlefield4 || ProfilesLibrary.DataVersion == (int)ProfileVersion.NeedForSpeed || ProfilesLibrary.DataVersion == (int)ProfileVersion.PlantsVsZombiesGardenWarfare2 || ProfilesLibrary.DataVersion == (int)ProfileVersion.NeedForSpeedRivals)
-                    {
-                        if (basePath == "")
-                            return;
-
-                        // read base toc to determine binary status
-                        using (DbReader reader = new DbReader(new FileStream(basePath, FileMode.Open, FileAccess.Read), parent.fs.CreateDeobfuscator()))
-                            toc = reader.ReadDbObject();
-
-                        // binary superbundle
-                        if (toc.GetValue<bool>("alwaysEmitSuperBundle") || ProfilesLibrary.DataVersion == (int)ProfileVersion.PlantsVsZombiesGardenWarfare2)
-                            isBinary = true;
-                    }
-
                     if (path != "")
                     {
                         if (!File.Exists(path.Replace(".toc", ".sb")))
@@ -117,13 +104,20 @@ namespace Frosty.ModSupport
                         containsBundlesToModify = true;
                     }
 
+                    // binary superbundle
+                    isBinary = !toc.GetValue<bool>("cas");
+
                     bool tocChanged = false;
                     bool sbChanged = false;
 
                     // special handling for chunk bundles
                     //if (superBundle.Contains("chunks"))
-                    if (toc.HasValue("chunks"))
+                    if (toc.HasValue("chunks") && toc.GetValue<DbObject>("chunks").Count > 0)
                     {
+#if FROSTY_DEVELOPER
+                        Debug.Assert(toc.HasValue("bundles") ? toc.GetValue<DbObject>("bundles").Count == 0 : true);
+#endif
+
                         if (parent.modifiedBundles.ContainsKey(chunksBundleHash))
                         {
                             FileInfo sbFi = new FileInfo(parent.fs.BasePath + modPath + "/" + superBundle + ".sb");
@@ -149,15 +143,18 @@ namespace Frosty.ModSupport
 
                                 bool isModified = false;
 
-                                DbObject baseToc = null;
-                                using (DbReader reader = new DbReader(new FileStream(basePath, FileMode.Open, FileAccess.Read), parent.fs.CreateDeobfuscator()))
-                                    baseToc = reader.ReadDbObject();
-
-                                // update chunk list with base chunks
                                 DbObject chunkList = new DbObject(false);
-                                foreach (DbObject chunk in baseToc.GetValue<DbObject>("chunks"))
-                                    chunkList.Add(chunk);
-
+                                if (!string.IsNullOrEmpty(basePath))
+                                {
+                                    DbObject baseToc = null;
+                                    using (DbReader reader = new DbReader(new FileStream(basePath, FileMode.Open, FileAccess.Read), parent.fs.CreateDeobfuscator()))
+                                        baseToc = reader.ReadDbObject();
+                                    
+                                    // update chunk list with base chunks
+                                    foreach (DbObject chunk in baseToc.GetValue<DbObject>("chunks"))
+                                        chunkList.Add(chunk);
+                                }
+                                
                                 // update chunk list with patch chunks
                                 foreach (DbObject chunk in toc.GetValue<DbObject>("chunks"))
                                 {
@@ -271,50 +268,55 @@ namespace Frosty.ModSupport
                                         toc.AddValue("cas", true);
                                     }
 
-                                    DbObject baseToc = null;
-                                    using (DbReader reader = new DbReader(new FileStream(basePath, FileMode.Open, FileAccess.Read), parent.fs.CreateDeobfuscator()))
-                                        baseToc = reader.ReadDbObject();
-
                                     // iterate thru base toc looking for chunks
                                     DbObject chunkList = toc.GetValue<DbObject>("chunks");
-                                    foreach (DbObject chunk in baseToc.GetValue<DbObject>("chunks"))
+                                    if (!string.IsNullOrEmpty(basePath))
                                     {
-                                        Guid id = chunk.GetValue<Guid>("id");
-                                        if (chunkBundle.Modify.Chunks.Contains(id))
+                                        DbObject baseToc = null;
+                                        using (DbReader reader = new DbReader(new FileStream(basePath, FileMode.Open, FileAccess.Read), parent.fs.CreateDeobfuscator()))
+                                            baseToc = reader.ReadDbObject();
+
+                                        foreach (DbObject chunk in baseToc.GetValue<DbObject>("chunks"))
                                         {
-                                            DbObject chunkToEdit = chunk;
-                                            bool bFound = false;
-
-                                            foreach (DbObject patchChunk in toc.GetValue<DbObject>("chunks"))
+                                            Guid id = chunk.GetValue<Guid>("id");
+                                            if (chunkBundle.Modify.Chunks.Contains(id))
                                             {
-                                                Guid patchId = patchChunk.GetValue<Guid>("id");
-                                                if (patchId == id)
+                                                DbObject chunkToEdit = chunk;
+                                                bool bFound = false;
+
+                                                foreach (DbObject patchChunk in toc.GetValue<DbObject>("chunks"))
                                                 {
-                                                    chunkToEdit = patchChunk;
-                                                    bFound = true;
-                                                    break;
+                                                    Guid patchId = patchChunk.GetValue<Guid>("id");
+                                                    if (patchId == id)
+                                                    {
+                                                        chunkToEdit = patchChunk;
+                                                        bFound = true;
+                                                        break;
+                                                    }
+                                                }
+
+                                                if (!bFound)
+                                                    chunkList.Insert(0, chunkToEdit);
+
+                                                ChunkAssetEntry entry = parent.modifiedChunks[id];
+                                                chunkToEdit.SetValue("sha1", entry.Sha1);
+                                                chunkToEdit.RemoveValue("base");
+                                                chunkToEdit.SetValue("delta", true);
+
+                                                if (entry.IsTocChunk)
+                                                {
+                                                    if (!casRefs.Contains(entry.Sha1))
+                                                    {
+                                                        casRefs.Add(entry.Sha1);
+                                                        chunkEntries.Add(entry);
+                                                    }
                                                 }
                                             }
 
-                                            if (!bFound)
-                                                chunkList.Insert(0, chunkToEdit);
-
-                                            ChunkAssetEntry entry = parent.modifiedChunks[id];
-                                            chunkToEdit.SetValue("sha1", entry.Sha1);
-                                            chunkToEdit.SetValue("delta", true);
-
-                                            if (entry.IsTocChunk)
-                                            {
-                                                if (!casRefs.Contains(entry.Sha1))
-                                                {
-                                                    casRefs.Add(entry.Sha1);
-                                                    chunkEntries.Add(entry);
-                                                }
-                                            }
+                                            tocChanged = true;
                                         }
-
-                                        tocChanged = true;
                                     }
+
 
                                     // @hack: to ensure new chunks are only added to the chunks bundles
                                     if (superBundle.Contains("chunks"))
@@ -444,6 +446,21 @@ namespace Frosty.ModSupport
                             using (DbReader reader = new DbReader(new FileStream(basePath, FileMode.Open, FileAccess.Read), parent.fs.CreateDeobfuscator()))
                                 baseToc = reader.ReadDbObject();
 
+                            // Add new bundles to the TOC
+                            if (parent.addedBundles.ContainsKey(sbHash))
+                            {
+                                foreach (string newBundle in parent.addedBundles[sbHash])
+                                {
+                                    DbObject newTocBundle = new DbObject();
+                                    newTocBundle.SetValue("id", newBundle);
+                                    newTocBundle.SetValue("offset", (long)0xDEADBEEF);
+                                    newTocBundle.SetValue("size", 0L);
+                                    newTocBundle.SetValue("delta", true);
+                                    toc.GetValue<DbObject>("bundles").Add(newTocBundle);
+                                    tocChanged = true;
+                                }
+                            }
+
                             foreach (DbObject bundle in baseToc.GetValue<DbObject>("bundles"))
                             {
                                 BaseBundleInfo info = new BaseBundleInfo
@@ -479,8 +496,16 @@ namespace Frosty.ModSupport
                                 bool isDelta = bundle.GetValue<bool>("delta");
                                 long baseBundleDataOffset = 0;
                                 bool isModified = false;
+                                bool isAdded = false;
 
-                                if (isDelta)
+                                // Is this a new bundle?
+                                if (bundle.GetValue<long>("offset") == 0xDEADBEEF)
+                                {
+                                    isAdded = true;
+                                    isModified = true;
+                                }
+
+                                if (isDelta && !isAdded)
                                 {
                                     if (parent.modifiedBundles.ContainsKey(bundleName))
                                     {
@@ -698,7 +723,7 @@ namespace Frosty.ModSupport
                                 else
                                 {
                                     // only base bundles that have affected assets are modified
-                                    if (parent.modifiedBundles.ContainsKey(bundleName))
+                                    if (parent.modifiedBundles.ContainsKey(bundleName) && !isAdded)
                                     {
                                         isModified = true;
                                         BaseBundleInfo bi = baseBundles[bundleName];
@@ -826,6 +851,33 @@ namespace Frosty.ModSupport
                                             isModified = true;
                                         }
                                     }
+                                    foreach (string name in modifiedBundle.Add.Res)
+                                    {
+                                        ResAssetEntry entry = parent.modifiedRes[name];
+                                        DbObject newObj = DbObject.CreateObject();
+
+                                        newObj.SetValue("name", entry.Name);
+                                        newObj.SetValue("sha1", entry.Sha1);
+                                        newObj.SetValue("originalSize", entry.OriginalSize);
+                                        newObj.SetValue("data", parent.archiveData[entry.Sha1].Data);
+                                        newObj.SetValue("dataCompressed", true);
+                                        newObj.SetValue("resRid", entry.ResRid);
+                                        newObj.SetValue("resMeta", entry.ResMeta);
+                                        newObj.SetValue("resType", entry.ResType);
+
+                                        AssetInfo info = new AssetInfo
+                                        {
+                                            Name = entry.Name,
+                                            BaseAsset = newObj,
+                                            Modified = true,
+                                            Inserted = true,
+                                            Asset = newObj
+                                        };
+                                        info.NameHash = Fnv1.HashString(info.Name);
+                                        isModified = true;
+
+                                        resAssetInfo.Add(info);
+                                    }
                                     foreach (AssetInfo info in chunkAssetInfo)
                                     {
                                         if (modifiedBundle.Modify.Chunks.Contains(info.Id) && !info.Removed)
@@ -844,7 +896,7 @@ namespace Frosty.ModSupport
                                             newObj.SetValue("sha1", info.Asset.GetValue<Sha1>("sha1"));
                                             newObj.SetValue("logicalOffset", entry.LogicalOffset);
                                             newObj.SetValue("logicalSize", entry.LogicalSize);
-                                            newObj.SetValue("originalSize", entry.LogicalSize);
+                                            newObj.SetValue("originalSize", (entry.LogicalOffset & 0xFFFF) | entry.LogicalSize);
                                             newObj.SetValue("data", data);
                                             newObj.SetValue("dataCompressed", true);
 
@@ -853,6 +905,47 @@ namespace Frosty.ModSupport
                                             info.Asset = newObj;
                                             isModified = true;
                                         }
+                                    }
+                                    foreach (Guid id in modifiedBundle.Add.Chunks)
+                                    {
+                                        ChunkAssetEntry entry = parent.modifiedChunks[id];
+                                        DbObject newObj = DbObject.CreateObject();
+
+                                        byte[] data = parent.archiveData[entry.Sha1].Data;
+                                        if (entry.LogicalOffset != 0)
+                                        {
+                                            data = new byte[entry.RangeEnd - entry.RangeStart];
+                                            Array.Copy(parent.archiveData[entry.Sha1].Data, entry.RangeStart, data, 0, data.Length);
+                                        }
+
+                                        newObj.SetValue("id", entry.Id);
+                                        newObj.SetValue("sha1", entry.Sha1);
+                                        newObj.SetValue("logicalOffset", entry.LogicalOffset);
+                                        newObj.SetValue("logicalSize", entry.LogicalSize);
+                                        newObj.SetValue("originalSize", (entry.LogicalOffset & 0xFFFF) | entry.LogicalSize);
+                                        newObj.SetValue("data", data);
+                                        newObj.SetValue("dataCompressed", true);
+
+                                        DbObject meta = new DbObject();
+                                        meta.SetValue("h32", entry.H32);
+                                        meta.SetValue("meta", new DbObject());
+                                        if (entry.FirstMip != -1)
+                                        {
+                                            meta.GetValue<DbObject>("meta").SetValue("firstMip", entry.FirstMip);
+                                        }
+
+                                        AssetInfo info = new AssetInfo
+                                        {
+                                            Id = entry.Id,
+                                            BaseAsset = newObj,
+                                            Modified = true,
+                                            Inserted = true,
+                                            Asset = newObj,
+                                            Meta = meta
+                                        };
+                                        isModified = true;
+
+                                        chunkAssetInfo.Add(info);
                                     }
                                 }
 
@@ -995,7 +1088,7 @@ namespace Frosty.ModSupport
                                         AssetInfo info = totalAssetInfo[y];
 
                                         long size = info.Asset.GetValue<long>("originalSize");
-                                        uint blockSize = (uint)((size / 0x10000) + ((size % 0x10000) != 0 ? 1 : 0));
+                                        uint blockSize = (uint)((ulong)(size / 0x10000) + (ulong)((ulong)(size % 0x10000) != 0 ? 1 : 0));
 
                                         if (info.Removed)
                                         {
@@ -1015,7 +1108,7 @@ namespace Frosty.ModSupport
                                             if (!info.Inserted)
                                             {
                                                 long origSize = info.BaseAsset.GetValue<long>("originalSize");
-                                                uint origBlockSize = (uint)((origSize / 0x10000) + ((origSize % 0x10000) != 0 ? 1 : 0));
+                                                uint origBlockSize = (uint)((ulong)(origSize / 0x10000) + (ulong)((ulong)(origSize % 0x10000) != 0 ? 1 : 0));
                                                 if (origBlockSize > 0)
                                                     writer.Write(origBlockSize | 0x40000000, Endian.Big);
                                             }
@@ -1312,6 +1405,7 @@ namespace Frosty.ModSupport
                                         int index = 0;
                                         foreach (DbObject chunk in sbBundle.GetValue<DbObject>("chunks"))
                                         {
+                                            index++;
                                             Guid id = chunk.GetValue<Guid>("id");
                                             if (modBundle.Remove.Chunks.Contains(id))
                                             {
@@ -1329,7 +1423,7 @@ namespace Frosty.ModSupport
 
                                                 if (chunkEntry.FirstMip != -1)
                                                 {
-                                                    DbObject chunkMeta = null;
+                                                    //DbObject chunkMeta = null;
                                                     foreach (DbObject curMeta in sbBundle.GetValue<DbObject>("chunkMeta"))
                                                     {
                                                         if (curMeta.GetValue<int>("h32") == chunkEntry.H32)
@@ -1341,7 +1435,7 @@ namespace Frosty.ModSupport
                                                     //chunkMeta.GetValue<DbObject>("meta").RemoveValue("firstMip");
                                                     //chunkMeta.GetValue<DbObject>("meta").RemoveValue("firstMip");
                                                     if (ProfilesLibrary.DataVersion == (int)ProfileVersion.MassEffectAndromeda || ProfilesLibrary.DataVersion == (int)ProfileVersion.Fifa18 || ProfilesLibrary.DataVersion == (int)ProfileVersion.StarWarsBattlefrontII || ProfilesLibrary.DataVersion == (int)ProfileVersion.Madden19)
-                                                        chunk.SetValue("bundledSize", (int)(chunkEntry.RangeEnd - chunkEntry.RangeStart)); chunk.SetValue("bundledSize", chunkEntry.Size);
+                                                        chunk.SetValue("bundledSize", (int)(chunkEntry.RangeEnd - chunkEntry.RangeStart));
                                                 }
                                                 else
                                                 {

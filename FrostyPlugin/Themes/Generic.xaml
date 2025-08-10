@@ -175,6 +175,11 @@
                         <DockPanel Grid.Row="0">
                             <Border Background="{StaticResource ControlBackground}" Margin="1">
                                 <StackPanel VerticalAlignment="Center" Orientation="Horizontal" Margin="0,0,6,0" Height="24">
+                                    <!-- Find Opened Asset -->
+                                    <Button Height="20" Width="20" ToolTip="Find Opened Asset" HorizontalAlignment="Right" Margin="6,0,0,0" Command="{Binding Path=FindOpenedAssetCommand, RelativeSource={RelativeSource AncestorType={x:Type local:FrostyDataExplorer}}}">
+                                        <Image Source="/FrostyEditor;component/Images/Open.png" Width="16"/>
+                                    </Button>
+                                    <!-- Show Only Modified -->
                                     <CheckBox x:Name="PART_ShowOnlyModifiedCheckBox" VerticalAlignment="Center" Margin="6,0,0,0" IsChecked="{Binding Path=ShowOnlyModified, RelativeSource={RelativeSource Mode=FindAncestor, AncestorType={x:Type local:FrostyDataExplorer}}}">
                                         <TextBlock Text="Show only modified" Margin="4,-1,0,0" VerticalAlignment="Center" Foreground="{StaticResource FontColor}"/>
                                     </CheckBox>
@@ -801,10 +806,12 @@
                                                         <Button x:Name="PART_OpenButton" Content="Open asset" Style="{StaticResource MenuButtonStyle}" FontFamily="MS Reference Sans Serif" Height="22"/>
                                                         <Button x:Name="PART_FindButton" Content="Find in data explorer" Style="{StaticResource MenuButtonStyle}" FontFamily="MS Reference Sans Serif" Height="22"/>
                                                         <Button x:Name="PART_CreateButton" Content="Create new ..." Style="{StaticResource MenuButtonStyle}" FontFamily="MS Reference Sans Serif" Height="22"/>
-
+                                                        
                                                         <Border x:Name="PART_Separator" Height="22">
                                                             <Separator Margin="1,0,1,0"/>
                                                         </Border>
+
+                                                        <ctrl:FrostyWatermarkTextBox x:Name="PART_FilterTextBox" Height="24" Margin="1,0,1,1" WatermarkText="Filter" VerticalContentAlignment="Center" BorderThickness="1"/>
 
                                                         <Border x:Name="PART_TBBorder" Height="22">
                                                             <TextBlock x:Name="PART_TextBlock" VerticalAlignment="Center" Text="Select Class" Margin="4,0,0,0" Foreground="{StaticResource FontColor}" Opacity="0.5" FontFamily="MS Reference Sans Serif"/>
@@ -1200,9 +1207,9 @@
 
     <Style TargetType="{x:Type editors:FrostyRotationControl}" BasedOn="{StaticResource {x:Type editors:FrostyVectorControl}}">
         <Setter Property="ControlType" Value="Vec3"/>
-        <Setter Property="XLabel" Value="Y"/>
-        <Setter Property="YLabel" Value="P"/>
-        <Setter Property="ZLabel" Value="R"/>
+        <Setter Property="XLabel" Value="X"/>
+        <Setter Property="YLabel" Value="Y"/>
+        <Setter Property="ZLabel" Value="Z"/>
     </Style>
 
     <!-- FrostyAssetListView -->

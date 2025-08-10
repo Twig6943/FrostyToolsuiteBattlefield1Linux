@@ -143,7 +143,7 @@ namespace LocalizedStringPlugin
 
         private void Refresh_Click(object sender, RoutedEventArgs e)
         {
-            FrostyTaskWindow.Show("Loading strings", "", (task) =>
+            FrostyTaskWindow.Show("Loading Strings", "", (task) =>
             {
                 stringIds = db.EnumerateStrings().Distinct().ToList();
                 stringIds.Sort();
@@ -291,7 +291,7 @@ namespace LocalizedStringPlugin
         {
             if (firstTimeLoad)
             {
-                FrostyTaskWindow.Show("Loading strings", "", (task) =>
+                FrostyTaskWindow.Show("Loading Strings", "", (task) =>
                 {
                     stringIds = db.EnumerateStrings().Distinct().ToList();
                     stringIds.Sort();
@@ -480,9 +480,9 @@ namespace LocalizedStringPlugin
             FrostySaveFileDialog sfd = new FrostySaveFileDialog("Save Localized Strings", "*.csv (CSV File)|*.csv", "LocalizedStrings");
             if (sfd.ShowDialog())
             {
-                FrostyTaskWindow.Show("Exporting Localized Strings", "", (task) =>
+                FrostyTaskWindow.Show("Exporting Localized Strings", "", (logger) =>
                 {
-                    using (NativeWriter writer = new NativeWriter(new FileStream(sfd.FileName, FileMode.Create), false, true))
+                    using (StreamWriter writer = new StreamWriter(sfd.FileName))
                     {
                         int index = 0;
                         foreach (uint stringId in stringIds)
@@ -494,7 +494,7 @@ namespace LocalizedStringPlugin
                             str = str.Replace("\"", "\"\"");
 
                             writer.WriteLine(stringId.ToString("X8") + ",\"" + str + "\"");
-                            task.Update(progress: ((index++) / (double)stringIds.Count) * 100.0);
+                            logger.LogProgress(((index++) / (double)stringIds.Count) * 100.0);
                         }
                     }
                 });
@@ -512,11 +512,11 @@ namespace LocalizedStringPlugin
                 int added = 0;
                 FrostyTaskWindow.Show("Importing Localized Strings", "", (task) =>
                 {
-                    using (NativeReader reader = new NativeReader(new FileStream(ofd.FileName, FileMode.Open)))
+                    using (StreamReader reader = new StreamReader(ofd.FileName))
                     {
-                        while (reader.Position < reader.Length)
+                        while (!reader.EndOfStream)
                         {
-                            string line = reader.ReadWideLine();
+                            string line = reader.ReadLine();
                             uint hash = uint.Parse(line.Substring(0, 8), System.Globalization.NumberStyles.HexNumber);
                             string s = line.Substring(10, line.Length - 11);
                             if (stringIds.Contains(hash) && s != db.GetString(hash))
@@ -547,7 +547,7 @@ namespace LocalizedStringPlugin
             FrostySaveFileDialog sfd = new FrostySaveFileDialog("Save Localized Strings Usage List", "*.txt (Text File)|*.txt", "LocalizedStringsUsage");
             if (sfd.ShowDialog())
             {
-                FrostyTaskWindow.Show("Exporting Localized Strings Usage", "", (task) =>
+                FrostyTaskWindow.Show("Exporting Localized Strings Usage", "", (logger) =>
                 {
                     uint totalCount = (uint)App.AssetManager.EnumerateEbx().ToList().Count;
                     uint idx = 0;
@@ -558,7 +558,7 @@ namespace LocalizedStringPlugin
                     }
                     foreach (EbxAssetEntry refEntry in App.AssetManager.EnumerateEbx())
                     {
-                        task.Update("Checking: " + refEntry.Name, (idx++ / (double)totalCount) * 100.0d);
+                        logger.LogProgress("Checking: " + refEntry.Name, (idx++ / (double)totalCount) * 100.0d);
                         EbxAsset refAsset = App.AssetManager.GetEbx(refEntry);
                         List<string> AlreadyDone = new List<string>();
                         foreach (dynamic obj in refAsset.Objects)
@@ -599,7 +599,7 @@ namespace LocalizedStringPlugin
                         }
                     }
 
-                    using (NativeWriter writer = new NativeWriter(new FileStream(sfd.FileName, FileMode.Create), false, true))
+                    using (StreamWriter writer = new StreamWriter(sfd.FileName))
                     {
                         foreach (string StringData in StringInfo.Values)
                         {
